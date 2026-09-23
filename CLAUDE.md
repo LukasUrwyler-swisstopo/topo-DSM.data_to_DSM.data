@@ -54,6 +54,9 @@ Gilt für **beide Tabs** (ASCII und LAZ) – sie unterscheiden sich nur im Einle
 ## Bekannte Fallstricke (getestet, nicht annehmen)
 - `pdal.exe` ist nicht long-path-fähig: Pfade > 259 Zeichen ergeben nur „file not found“.
   Staging-Namen deshalb kurz halten; `_check_path_lengths()` prüft vor dem Lauf.
+- Defekte LAZ-Chunk-Tabelle (Offset falsch/abgeschnitten): `pdal tile` bricht erst beim Lesen ab
+  („Invalid version N found in LAZ chunk table“) oder **hängt** (Version zufällig 0). Auch Offset -1
+  (Tabelle am Dateiende) liest PDAL 2.10 nicht. `_las_integrity_error()` prüft das vorab (Info + Schritt 2).
 - `readers.text`: passt die Spaltenzahl nicht, wird jede Zeile nur mit Warnung übersprungen –
   Exit-Code 0, leere Datei. Punktzahl immer prüfen. Der `header`-String muss das Trennzeichen der
   Datei verwenden (Tab: `X\tY\tZ`).

@@ -205,6 +205,41 @@ def _read_las_header(path: str) -> dict:
     }
 
 
+def _las_integrity_error(path: str, header: dict) -> str:
+    """'' wenn die Datei strukturell lesbar ist, sonst die Fehlerbeschreibung.
+    LAZ: Die ersten 8 Bytes der Punktdaten zeigen auf die Chunk-Tabelle (U32 Version = 0,
+    U32 Anzahl Chunks). Ist der Zeiger falsch (Datei abgeschnitten, Schreibvorgang
+    abgebrochen), bricht pdal erst beim Lesen ab ('Invalid version N found in LAZ chunk
+    table') oder haengt bei zufaellig passender Version. Getestet mit PDAL 2.10: auch der
+    LASzip-Sonderfall Offset -1 (Tabelle am Dateiende) ist fuer pdal nicht lesbar.
+    LAS: Dateigroesse muss alle Punkt-Records fassen."""
+    size = os.path.getsize(path)
+    start = header["offset_to_point_data"]
+    with open(path, "rb") as f:
+        if not header["compressed"]:
+            f.seek(105)
+            rec_len, = struct.unpack("<H", f.read(2))
+            need = start + header["count"] * rec_len
+            return "" if size >= need else (f"Datei abgeschnitten ({size:,} statt mind. {need:,} Bytes)"
+                                            .replace(",", "'"))
+        f.seek(start)
+        raw = f.read(8)
+        if len(raw) < 8:
+            return "Datei abgeschnitten (keine Punktdaten)"
+        table, = struct.unpack("<q", raw)
+        if table == -1:
+            return "Chunk-Tabellen-Offset -1 (Tabelle am Dateiende) - von pdal nicht lesbar"
+        if not start + 8 <= table <= size - 8:
+            return f"Chunk-Tabellen-Offset {table} ausserhalb der Punktdaten ({start + 8}-{size - 8})"
+        f.seek(table)
+        version, n_chunks = struct.unpack("<II", f.read(8))
+    if version != 0:
+        return f"Chunk-Tabelle ungueltig (Version {version} statt 0)"
+    if n_chunks > max(1, header["count"]) or (header["count"] and not n_chunks):
+        return f"Chunk-Tabelle ungueltig ({n_chunks} Chunks bei {header['count']} Punkten)"
+    return ""
+
+
 def _read_vlrs(path: str, header: dict = None) -> list:
     """(user_id, record_id, payload) aller VLRs - nur der unkomprimierte Kopfbereich."""
     header = header or _read_las_header(path)
@@ -627,6 +662,21 @@ def _height_suffix(height_ref: str) -> str:
     return f"_LV95_{height_ref}"
 
 
+def _job_name(jahr: str, area: str, thin_m, height_ref: str) -> str:
+    """Kachelname ohne TileKey (<NAME>) und Endung - Name des Staging-Job-Ordners und
+    (im GUI) der Log-Datei, z.B. 2021_PERROC_TIN_DSM_thin04_LV95_LN02."""
+    return _las_tile_base(jahr, area, thin_m) + _height_suffix(height_ref)
+
+
+def _unique_dir(parent: Path, name: str) -> Path:
+    """parent/name, bei bestehendem Ordner (behaltenes Staging, paralleler Lauf) name_2, name_3 ..."""
+    path, n = parent / name, 1
+    while path.exists():
+        n += 1
+        path = parent / f"{name}_{n}"
+    return path
+
+
 def _target_point_format(source_formats) -> int:
     """Ziel-PF (LAS 1.4) nach den Feldern der Quelle: PF6, PF7 falls RGB, PF8 falls RGB+NIR.
     PF0/1 -> 6, PF2/3 -> 7, PF6/7/8 bleiben. Waveform (PF4/5/9/10) schreibt PDAL nicht."""
@@ -743,6 +793,8 @@ def _info(cfg: dict) -> None:
             "crs_tag": _pdal_srs_name(pdal_exe, files[0]) if pdal_exe else "(pdal.exe nicht gefunden)",
             "vertical_tags": vertical_tags,
             "n_cells_max": len(cells),
+            "broken": [f"{os.path.basename(p)}: {err}" for p, h in zip(files, headers)
+                       for err in [_las_integrity_error(p, h)] if err],
         })
         if pdal_exe:
             try:
@@ -1400,9 +1452,12 @@ def _process(cfg: dict) -> None:
         point_format = OUT_POINT_FORMAT_RGB
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    run_dir = Path(staging_dir) / f"d2l_{time.strftime('%y%m%d_%H%M%S')}"
+    staging_drive = Path(os.path.abspath(staging_dir)).anchor
+    if not os.path.isdir(staging_drive):
+        raise FileNotFoundError(f"Laufwerk des Staging-Ordners nicht verfuegbar: {staging_dir}")
+    run_dir = _unique_dir(Path(staging_dir), _job_name(jahr, area, thin_m, height_ref))
     _check_path_lengths(files, run_dir, output_dir, max(len(b) for b in groups), suffix)
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True)
 
     _log(f"Input-Ordner   : {input_dir}")
     _log(f"Input-Format   : {fmt.upper()}  ({len(files)} Datei(en))")
@@ -1473,6 +1528,17 @@ def _process(cfg: dict) -> None:
         # 2) Header, Koordinaten-/Hoehenplausibilitaet, Ueberlappungen
         _log("\n[2/4] Quell-Header pruefen ...")
         headers = {s: _read_las_header(s) for s in sources}
+        if fmt == "las":
+            # Defekte Dateien jetzt melden - sonst bricht erst 'pdal tile' ab, nachdem alle
+            # anderen Quellen bereits zerlegt sind
+            broken = [f"{names[s]}: {err}" for s in sources
+                      for err in [_las_integrity_error(s, headers[s])] if err]
+            if broken:
+                raise ValueError(f"{len(broken)} Input-Datei(en) defekt (fuer pdal nicht lesbar):\n  "
+                                 + "\n  ".join(broken[:20])
+                                 + "\nDatei neu exportieren bzw. aus dem Original neu erzeugen. Reparaturversuch "
+                                   "mit LAStools: 'laszip -i <datei>.laz -o <neu>.laz', danach Punktzahl mit "
+                                   "dem Original vergleichen.")
         not_lv95, kinds = set(), set()
         for s, h in headers.items():
             crs = _classify_crs(h["minx"], h["miny"], h["maxx"], h["maxy"])
@@ -1646,10 +1712,11 @@ def _process(cfg: dict) -> None:
             _log(f"\nStaging-Dateien behalten: {run_dir}")
         else:
             shutil.rmtree(run_dir, ignore_errors=True)
-            try:
-                os.rmdir(staging_dir)  # nur falls leer (Standard-Unterordner '_staging')
-            except OSError:
-                pass
+            if not cfg.get("staging_dir"):
+                try:
+                    os.rmdir(staging_dir)  # Standard-Unterordner '_staging', nur falls leer
+                except OSError:
+                    pass
 
 
 def main() -> None:

@@ -39,6 +39,7 @@ PROCESS_SCRIPTS_DIR = os.path.join(SCRIPT_DIR, "process_scripts")
 RUNNER_SCRIPT       = os.path.join(PROCESS_SCRIPTS_DIR, "_osgeo_runner.py")
 CONFIG_FILE         = os.path.join(PROCESS_SCRIPTS_DIR, "_dsm2laz_config.json")
 DEFAULT_GRID_SHAPE  = os.path.join(SCRIPT_DIR, "swissGRID_1km2_shp", "chGRID_1km2.shp")
+DEFAULT_STAGING_DIR = r"Y:\01_DSMdata_to_DSMdata"   # Vorbelegung beider Tabs, im GUI aenderbar
 
 # ─── Auswahl-Listen ───────────────────────────────────────────────────────────
 ASCII_EXTENSIONS = (".xyz", ".txt", ".asc", ".csv")
@@ -492,12 +493,12 @@ class TilesTab:
     def _build_staging(self, parent):
         sec = self._section(parent, "Staging & Parallelisierung")
         self._bold(sec, "Staging-Ordner:", 0)
-        self._staging_var = tk.StringVar()
+        self._staging_var = tk.StringVar(value=DEFAULT_STAGING_DIR)
         ttk.Entry(sec, textvariable=self._staging_var).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
         ttk.Button(sec, text="Ordner…", command=self._browse_staging).grid(row=0, column=2, pady=3)
         inhalt = "ASCII→LAZ, Kachelstuecke, Raster-Zellen" if self.fmt == "ascii" else "Kachelstuecke, Raster-Zellen"
-        self._hint(sec, "Leer = <Output-Ordner>\\_staging  |  Zwischendateien ({}), Platzbedarf etwa "
-                        "Datenmenge als LAZ".format(inhalt), 1)
+        self._hint(sec, "Job-Unterordner <Jahr>_<AREA>_TIN_DSM[_thinNN]_LV95_<Hoehe>  |  Leer = <Output-Ordner>"
+                        "\\_staging  |  Zwischendateien ({}), Platzbedarf etwa Datenmenge als LAZ".format(inhalt), 1)
 
         self._bold(sec, "CPU-Kerne:", 2, pady=(8, 3))
         cpu_max = max(1, os.cpu_count() or 4)
@@ -680,6 +681,10 @@ class TilesTab:
             hint = "Spalten-Reihenfolge / Trennzeichen pruefen." if self.fmt == "ascii" \
                    else "Header-BBox der Dateien pruefen."
             warnings.append("⚠  Koordinaten weder LV95 noch LV03 – " + hint)
+        broken = info.get("broken") or []
+        if broken:
+            warnings.append("⚠  {} Datei(en) defekt, fuer pdal nicht lesbar – der Lauf bricht ab:\n    {}".format(
+                len(broken), "\n    ".join(broken[:5] + (["…"] if len(broken) > 5 else []))))
 
         if warnings:
             self._info_warn.config(text="\n".join(warnings))
@@ -823,7 +828,12 @@ class TilesTab:
                 "skip":      int(self._skip_var.get().strip() or 0),
             })
 
-        self.app._start_run(cfg, "{}_to_laz".format(Path(inp).name), TAB_LABELS[self.fmt])
+        # Log-Name = Name des Staging-Job-Ordners (Regel im Runner), plus Zeitstempel
+        try:
+            log_stem = _runner_module()._job_name(cfg["jahr"], cfg["area"], cfg["thin_m"], cfg["height_ref"])
+        except Exception:
+            log_stem = "{}_to_laz".format(Path(inp).name)
+        self.app._start_run(cfg, log_stem, TAB_LABELS[self.fmt])
 
 
 # ─── Haupt-App ─────────────────────────────────────────────────────────────────
