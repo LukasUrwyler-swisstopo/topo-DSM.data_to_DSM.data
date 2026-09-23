@@ -17,7 +17,7 @@ def load_module_from_path(name, path):
 
 
 def _gui():
-    return load_module_from_path("gui_module", os.path.join(PROJECT_ROOT, "GUI_dsmAsciiToLaz.py"))
+    return load_module_from_path("gui_module", os.path.join(PROJECT_ROOT, "GUI_DSMdata_to_DSMdata.py"))
 
 
 def _runner():

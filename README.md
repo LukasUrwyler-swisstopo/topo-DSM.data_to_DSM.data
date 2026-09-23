@@ -34,7 +34,7 @@ Punkte) – z.B. merged.laz und Einzelkacheln desselben Gebiets im selben Ordner
 ## GUI starten
 
 ```bash
-python GUI_dsmAsciiToLaz.py
+python GUI_DSMdata_to_DSMdata.py
 ```
 
 Beim ersten Start erkennt das GUI automatisch die OSGeo4W-/QGIS-Installation und die `pdal.exe`
@@ -212,7 +212,7 @@ als ASCII-Spalte vorhanden sind. Unbekannte ASCII-Spalten (`Col4` …) werden ni
 
 | Datei | Beschreibung |
 |-------|-------------|
-| `GUI_dsmAsciiToLaz.py` | Tkinter-GUI – startet mit Standard-Python (ab 3.6) |
+| `GUI_DSMdata_to_DSMdata.py` | Tkinter-GUI – startet mit Standard-Python (ab 3.6) |
 | `process_scripts/_osgeo_runner.py` | Worker (Aktionen `info` / `process`) – via OSGeo4W/QGIS-Python als Subprocess, steuert `pdal.exe`; enthält auch die Benennungsregel (vom GUI für die Vorschau genutzt) |
 | `process_scripts/01_convertDATA_dsm_to_laz_tiles.py` | Standalone-Script ohne GUI (gleiche Verarbeitung, Konfiguration im Script-Kopf) |
 | `process_scripts/_dsm2laz_config.json` | GUI-Konfiguration (OSGeo4W-Python-Pfad), wird automatisch angelegt |
@@ -229,7 +229,7 @@ als ASCII-Spalte vorhanden sind. Unbekannte ASCII-Spalten (`Col4` …) werden ni
 ## Architektur
 
 ```
-GUI_dsmAsciiToLaz.py                (Standard-Python, tkinter)
+GUI_DSMdata_to_DSMdata.py                (Standard-Python, tkinter)
         │  JSON-Config (tempfile)
         ▼
 process_scripts/_osgeo_runner.py    (OSGeo4W/QGIS-Python: OGR für das Grid)
