@@ -4,6 +4,9 @@ Wandelt alte DSM-Punktwolken (Lage bereits **LV95**) in GDWH-taugliche LAZ-Kache
 Grid-Shape (z.B. swissGRID 1km²) um – optional ausgedünnt und mit DSM-Raster + Hillshade. Struktur
 und Styling analog zu `topo-COGTIFFconverter` und `topo-DMCdataConverter`.
 
+<img width="935" height="991" alt="image" src="https://github.com/user-attachments/assets/bff725dc-a395-4984-b899-04a3027d4e68" />
+
+
 | Tab | Input | Output |
 |---|---|---|
 | **DSM.ascii → DSM.laz-Tiles** | ASCII (`.xyz` / `.txt` / `.asc` / `.csv`), typischerweise **gemergt pro Gebiet** | eine `.laz`/`.las` je Grid-Zelle, optional DSM + Hillshade |
