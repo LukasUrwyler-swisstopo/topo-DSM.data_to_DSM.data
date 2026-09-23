@@ -1,39 +1,35 @@
 # DSM ASCII/LAZ → LAZ-Tiles
 
-Wandelt alte DSM-Punktwolken (bereits **LV95 / LN02**) in GDWH-taugliche LAZ-Kacheln gemäss einem
-Grid-Shape (z.B. swissGRID 1km²) um. Struktur und Styling analog zu `topo-COGTIFFconverter` und
-`topo-DMCdataConverter`.
+Wandelt alte DSM-Punktwolken (Lage bereits **LV95**) in GDWH-taugliche LAZ-Kacheln gemäss einem
+Grid-Shape (z.B. swissGRID 1km²) um – optional ausgedünnt und mit DSM-Raster + Hillshade. Struktur
+und Styling analog zu `topo-COGTIFFconverter` und `topo-DMCdataConverter`.
 
-| Input | Verarbeitung | Output |
+| Tab | Input | Output |
 |---|---|---|
-| **ASCII** (`.xyz` / `.txt` / `.asc` / `.csv`), typischerweise **gemergt pro Gebiet** | ASCII → LAZ, dann Tiling | eine `.laz` je Grid-Zelle mit Daten |
-| **LAZ / LAS** (altes Tiling) | nur neues Tiling | eine `.laz` je Grid-Zelle mit Daten |
+| **DSM.ascii → DSM.laz-Tiles** | ASCII (`.xyz` / `.txt` / `.asc` / `.csv`), typischerweise **gemergt pro Gebiet** | eine `.laz`/`.las` je Grid-Zelle, optional DSM + Hillshade |
+| **DSM.laz → DSM.laz-Tiles** | LAZ / LAS, beliebiges Tiling oder ein merged.laz | eine `.laz`/`.las` je Grid-Zelle, optional DSM + Hillshade |
+
+Beide Tabs haben dieselben Eingaben in derselben Reihenfolge – der ASCII-Tab zusätzlich das
+**ASCII-Format**. Die CRS-Angabe der Quelle (LAZ: Tag, ASCII: Dateiname) darf falsch sein oder
+fehlen: getaggt wird, was im GUI gewählt ist.
 
 ## Benennung
 
 ```
-<Basis>_<NAME>_LV95_LN02.laz
+<Jahr>_<AREA>_TIN_DSM[_thin<NN>]_<NAME>_LV95_<LN02|LHN95>.<laz|las>
+<Jahr>_<AREA>_DSM_<GSD>cm_LV95_<LN02|LHN95>.tif        (+ .tfw, optional)
+<Jahr>_<AREA>_hillshade_<GSD>cm_LV95_<LN02|LHN95>.tif  (+ .tfw, optional)
 ```
 
-- **Basis** = Input-Dateiname bis vor `_LV95` – der Rest (z.B. `_CIR_low_raw`) fällt weg.
-- Endet die Basis auf einen **alten TileKey** (`_2600_1200`, `_1091-44`, `_600_200`), wird er entfernt.
-  Als TileKey gilt nur eine erste Zahl im Bereich LV95-km (2480–2840), LK25-Blatt (1011–1374) oder
-  LV03-km (480–840) – ein Jahr wie `_2015_1` bleibt stehen.
-- **NAME** = Attributfeld `NAME` des Grid-Shapes (z.B. `2600_1200`).
-- Die Endung `_LV95_LN02` entspricht dem Muster des GDWH-Imports (`4_SB_DSM_PUNKTWOLKE_LAS14upgrade.py`).
+- **NAME** = Attributfeld `NAME` des Grid-Shapes (z.B. `2612_1107`).
+- `<NN>` = Thinning in Dezimetern, zweistellig (0.2 m → `thin02`, 1.5 m → `thin15`); ohne Thinning
+  fällt der Teil weg.
+- Die Endung `_LV95_<Höhe>` entspricht dem Muster des GDWH-Imports (`4_SB_DSM_PUNKTWOLKE_LAS14upgrade.py`).
+- Beispiel: `2021_DIABLONS_TIN_DSM_thin02_2612_1107_LV95_LN02.laz`
 
-| Input | Output (Beispiel-Zelle 2600_1200) |
-|---|---|
-| `2015_RHONE_DSM_1m_LV95_LN02_CIR_low_raw.asc` (gemergt) | `2015_RHONE_DSM_1m_2600_1200_LV95_LN02.laz` |
-| `2015_RHONE_DSM_1m_1291-11_LV95_LN02.laz` (altes Tiling) | `2015_RHONE_DSM_1m_2600_1200_LV95_LN02.laz` |
-
-**Kachelsätze:** Dateien mit gleicher Basis ergeben **einen** Kachelsatz (ihre Punkte werden je
-Zelle zusammengeführt – z.B. die Kacheln eines alten Tilings). Dateien mit unterschiedlicher Basis
-(z.B. `2015_RHONE_…` und `2016_AARE_…` im selben Ordner) werden als **getrennte** Kachelsätze
-verarbeitet, auch wenn sie sich räumlich überlappen.
-
-Optional überschreibt das Feld **Basisname** die Automatik für alle Dateien (alles wird zu einem
-Kachelsatz). Die GUI zeigt die Zuordnung Input → Output als Vorschau.
+**Ein Kachelsatz je Lauf:** alle Dateien des Input-Ordners werden je Zelle zusammengeführt (z.B. die
+Kacheln eines alten Tilings). Überlappen sich zwei Dateien flächig, bricht der Lauf ab (doppelte
+Punkte) – z.B. merged.laz und Einzelkacheln desselben Gebiets im selben Ordner.
 
 ## GUI starten
 
@@ -49,46 +45,64 @@ daneben. Der Pfad kann über **Aendern…** gesetzt werden und wird in
 
 ## Bedienung
 
-1. **Input-Ordner** wählen – das **Input-Format** (ASCII oder LAZ/LAS) wird aus den Dateiendungen
-   vorgewählt. Verarbeitet werden alle passenden Dateien im Ordner (nicht rekursiv).
-2. **Output-Ordner** – muss ein anderer Ordner als der Input sein.
-3. **Grid-Shape** – Standard `swissGRID_1km2_shp/chGRID_1km2.shp`.
-4. **Datei-Info** prüft den Ordner:
-   - ASCII: Vorschau der ersten Zeilen, Trennzeichen, Spaltenzahl, Kopfzeilen, Koordinatenbereich →
-     füllt die Sektion **ASCII-Format** vor
-   - LAZ/LAS: Version/Punktformat, Punktzahl (Summe der Header), Extent, CRS-Tag, max. Kachelzahl
-5. **ASCII-Format** (nur bei ASCII): Spalten als PDAL-Dimensionen (`X Y Z`, oder z.B.
-   `X Y Z Intensity Classification`), Trennzeichen, Kopfzeilen überspringen.
-6. **Benennung** in der Vorschau prüfen, optional **Basisname** setzen.
-7. **Staging & Parallelisierung** – Zwischendateien (leer = `<Output>\_staging`), CPU-Kerne.
-8. **LAZ-TILES ERSTELLEN** starten.
+Das Formular folgt dem Arbeitsablauf; Log und Fortschritt sind für beide Tabs gemeinsam, während
+eines Laufs sind beide Start-Buttons gesperrt.
+
+| | Feld | Bedeutung |
+|---|---|---|
+| **1 Input** | Input-Ordner | alle Dateien des Tab-Formats (nicht rekursiv) = ein Kachelsatz |
+| | Datei-Info | wird beim Wählen des Ordners gelesen, siehe unten |
+| | ASCII-Format *(nur ASCII)* | Spalten als PDAL-Dimensionen (`X Y Z`, `X Y Z Intensity Classification` …), Trennzeichen, Kopfzeilen – aus der ersten Datei vorbelegt |
+| **2 Projekt & Referenzsystem** | Jahr, AREA / AOI | Teil des Namens (Jahr vierstellig, AREA ohne Leerzeichen) |
+| | CRS / SRS | `EPSG:2056 + 5728` (LV95 + LN02) oder `EPSG:2056 + 5729` (LV95 + LHN95) – nur Tag, **keine** Umrechnung |
+| | Thinning | kein / 0.1 / 0.2 / 0.4 / 0.8 / 1 / 1.5 / 2 m – `filters.sample` (Mindestabstand) wie in `topo-DMCdataConverter`, je Kachel nach dem Merge |
+| **3 Output** | Output-Ordner | muss ein anderer Ordner als der Input sein |
+| | Format | `laz` (LASzip, GDWH-Standard) oder `las` (unkomprimiert) |
+| | Grid-Shape | Standard `swissGRID_1km2_shp/chGRID_1km2.shp`, TileKey = Attribut `NAME` |
+| | Benennung | Vorschau inkl. Raster-Namen |
+| | Create DSM-Raster | blendet Raster-Output-Ordner und GSD (Default 0.5 m) ein |
+| **4 Staging** | Staging-Ordner, CPU-Kerne | Zwischendateien (leer = `<Output>\_staging`), Parallelisierung |
+
+### Datei-Info
+
+| | LAZ / LAS | ASCII |
+|---|---|---|
+| Übersicht | Dateien, Version/PF → Ausgabe-PF, Punkte (Summe der Header), Extent, max. Kachelzahl | Dateien, Trennzeichen/Spalten/Kopfzeilen → Ausgabe-PF, Vorschau der ersten Zeilen |
+| Metadaten 1. Datei | `pdal info --metadata` / `--schema`: Version/PF, Punkte, **Lage- und Höhen-CRS des Tags**, scale, offset, `global_encoding`, Software, VLRs, Dimensionen | Grösse, geschätzte Punktzahl, Lage (aus dem Wertebereich), **CRS-Angaben im Dateinamen** (LV95/LV03/LN02/LHN95/2056 …), 1. Zeile, Z-Bereich der ersten Zeilen |
+| Höhen-Warnung | Höhen-Tag ≠ Auswahl | `LN02`/`LHN95` im Dateinamen ≠ Auswahl |
+
+`pdal info --stats` wird bewusst nicht verwendet: es liest die ganze Punktwolke, bei einem grossen
+merged.laz dauert das Minuten. Eine Höhen-Warnung bricht nichts ab – so lässt sich eine falsche
+Angabe der Quelle korrigieren; sie passt sich an, wenn im Dropdown umgestellt wird.
 
 ---
 
 ## Ablauf
 
 ```
-ASCII (gemergt, .asc …)                   LAZ/LAS (altes Tiling)
+ASCII (gemergt, .asc …)                   LAZ/LAS (beliebiges Tiling / merged)
   │ [1] grosse Dateien an Zeilengrenzen           │
   │     in Teile zerlegt, readers.text → LAZ      │
   │     (parallel)                                 │
   └──────────────────────┬────────────────────────┘
                          ▼
-  [2] Header: Punktzahl, LV95-Plausibilität, Z-Bereich, Überlappung je Kachelsatz,
-      Grid-Zellen im Datenbereich
+  [2] Header: Punktzahl, LV95-Plausibilität, Z-Bereich, Höhenangabe der Quelle vs. Auswahl,
+      Überlappung, Grid-Zellen im Datenbereich
                          ▼
   [3] pdal tile je Quelle → Kachelstücke t<E>_<N>.laz   (Streaming, parallel)
                          ▼
-  [4] je Kachelsatz + Grid-Zelle Stücke mergen → <Basis>_<NAME>_LV95_LN02.laz  (parallel)
+  [4] je Grid-Zelle Stücke mergen (+ Thinning) → Endkachel  (parallel)
       Zielformat · CRS-VLRs · Validierung · atomares Schreiben
                          ▼
-  [5] Punktbilanz Input = Output, Staging aufräumen
+  [5] Punktbilanz Input = Output
+                         ▼
+  [6] optional DSM + Hillshade aus den fertigen Kacheln, Staging aufräumen
 ```
 
 **Warum `pdal tile`:** jede Quelle wird genau **einmal** gelesen (Streaming, wenig RAM) – ein
-gemergtes Gebiet über viele km² wird nicht pro Kachel erneut eingelesen. Die Stücke heissen nach
-dem Zellindex `floor(X/1000)_floor(Y/1000)`; die Zuordnung zum `NAME` erfolgt über die Geometrie des
-Grid-Shapes.
+gemergtes Gebiet über viele km² wird nicht pro Kachel erneut eingelesen, und es entsteht nie ein
+physisches merged.laz. Die Stücke heissen nach dem Zellindex `floor(X/1000)_floor(Y/1000)`; die
+Zuordnung zum `NAME` erfolgt über die Geometrie des Grid-Shapes.
 
 ### Zielformat der Kacheln
 
@@ -98,12 +112,12 @@ Identisch zu SB_DSM_PUNKTWOLKE / swissSURFACE3D (`topo-importDATAtoGDWHandSTAC`)
 | Eigenschaft | Wert |
 |---|---|
 | LAS-Version | 1.4, `header_size` 375 |
-| Point Data Record Format | **6** (PF7 = PF6 + RGB, nur wenn die Quelle Farbe führt bzw. ASCII-Spalten `Red/Green/Blue`) |
-| Kompression | LAZ (LASzip) |
+| Point Data Record Format | nach den Feldern der Quelle: PF0/1 → **PF6**, PF2/3 → **PF7** (RGB), PF6/7 bleiben, NIR (PF8/10) → PF8; ASCII: PF6, PF7 bei Spalten `Red/Green/Blue` |
+| Kompression | LAZ (LASzip) oder wahlweise unkomprimiertes LAS |
 | `global_encoding` | 17 – Bit 0 (Adjusted Standard GPS Time) + Bit 4 (WKT) |
 | `scale_x/y/z` | 0.01 |
 | `offset_x/y/z` | Kachelursprung aus dem Grid (`<E>*1000 / <N>*1000 / 0`) |
-| CRS-Tag | LV95 + LN02 (EPSG:2056 + 5728): byte-exakte Referenz-VLRs (GeoTIFF-Keys 34735 + WKT 2112) aus swissSURFACE3D |
+| CRS-Tag | LV95 + LN02 (EPSG:2056 + 5728): byte-exakte Referenz-VLRs (GeoTIFF-Keys 34735 + WKT 2112) aus swissSURFACE3D; LV95 + LHN95: davon abgeleitet (siehe [Koordinatensystem](#koordinatensystem)) |
 
 Die VLR-Injektion ist unverändert aus `topo-DMCdataConverter` übernommen (Begründung dort im
 README, „Warum die CRS-Tags byte-exakt injiziert werden“): PDAL schreibt bei `a_srs` einen nicht
@@ -113,18 +127,32 @@ Höhenbezug.
 Weitere Dimensionen (`Intensity`, `Classification`, …) werden übernommen, wenn sie in der Quelle bzw.
 als ASCII-Spalte vorhanden sind. Unbekannte ASCII-Spalten (`Col4` …) werden nicht geschrieben.
 
+### DSM-Raster + Hillshade
+
+Übernommen aus `topo-DMCdataConverter` (Create DSM-Raster), gerastert aus den **fertigen Kacheln**
+(also ausgedünnt, falls Thinning gewählt):
+
+- zellweise IDW (`writers.gdal`, 1-km-Arbeitszellen mit Puffer gegen Nähte) → VRT-Mosaik
+- kleine Löcher bis 900 m² interpoliert, grössere bleiben NoData
+- **DSM**: Float32, NoData **-3.4028235e+38** (GDWH-Konvention SB_DSM), CRS **LV95 + LN02/LHN95**
+  (zusammengesetztes CRS im GeoTIFF, `gdalinfo` zeigt z.B. `CH1903+ / LV95 + LHN95 height`)
+- **Hillshade**: Byte, NoData **255** (gültige Werte 1–254), CRS LV95
+- kein AOI-Shape: NoData genau dort, wo keine Punkte liegen; der Hillshade ist exakt dort NoData,
+  wo das DSM NoData ist
+- Kontrolle: NoData-Werte, CRS beider Raster, deckungsgleiches Gitter
+
 ### Fachliche Absicherungen
 
 - **Halb-offene Kachelgrenzen** `[E, E+1000)`: ein Punkt exakt auf einer Kilometerlinie (bei
   Raster-DSM im XYZ-Format der Normalfall) gehört genau **einer** Kachel.
 - **Punktbilanz**: Summe Input = Summe Output (+ Punkte ausserhalb des Grids als Warnung); jede
-  Abweichung ist ein Fehler.
-- **Überlappung innerhalb eines Kachelsatzes** (BBoxen zweier Input-Dateien mit gleicher Basis
-  überlappen > 1 %): Abbruch, weil beim Zusammenführen doppelte Punkte entstünden (Kachel-Buffer
-  oder zwei Varianten desselben Gebiets). Aneinanderstossende Kacheln sind kein Problem.
+  Abweichung ist ein Fehler. Mit Thinning wird sie *vor* dem Ausdünnen gezogen; das Log zeigt
+  zusätzlich den Anteil nach dem Thinning.
+- **Überlappung** (BBoxen zweier Input-Dateien überlappen > 1 %): Abbruch, weil beim Zusammenführen
+  doppelte Punkte entstünden. Aneinanderstossende Kacheln sind kein Problem.
 - **Pro Kachel validiert**: LAS 1.4 / PF, `header_size`, `global_encoding`, `scale`,
-  Offset = Kachelursprung, Punktzahl = Summe der Stücke, BBox im Kachelrahmen (±2 cm), genau die
-  zwei LV95/LN02-Referenz-VLRs.
+  Offset = Kachelursprung, Punktzahl = Summe der Stücke (mit Thinning: 1 … Summe), BBox im
+  Kachelrahmen (±2 cm), Kompression, genau die zwei Referenz-VLRs LV95/<Höhe> (byte-genau verglichen).
 - **Atomares Schreiben**: Temp-Datei im Output-Ordner, erst nach bestandener Validierung per
   `os.replace` an ihren Platz. Die Quelldateien werden nie verändert.
 - **ASCII-Spaltenzahl**: PDAL überspringt unpassende Zeilen nur mit Warnung (Exit-Code 0) – passt die
@@ -145,13 +173,24 @@ als ASCII-Spalte vorhanden sind. Unbekannte ASCII-Spalten (`Col4` …) werden ni
 
 ## Koordinatensystem
 
-- **Lage: LV95 (EPSG:2056)**, **Höhe: LN02 (EPSG:5728)** – beides wird vorausgesetzt und nur
-  getaggt, nie umgerechnet.
+- **Lage: immer LV95 (EPSG:2056)** – nur getaggt, nie umgerechnet. Massgebend ist der
+  **Koordinatenbereich**, nicht der Tag: eine Datei mit Tag `EPSG:4150` (CH1903+, das geographische
+  Basis-CRS von LV95) oder ganz ohne Tag wird akzeptiert, wenn die Werte LV95-Meter sind.
 - **LV03**-Koordinaten werden abgelehnt (bei ASCII schon vor dem Einlesen). PROJ fände für
   LV03 → LV95 ohne das CHENyx06-Gitter nur eine „Ballpark“-Transformation → zuerst mit
   **GeoSuite/REFRAME (FINELTRA)** transformieren.
-- **LHN95** wird abgelehnt: LAZ mit LHN95-Tag (WKT oder GeoTIFF-Key 5729) oder Dateiname mit
-  `LHN95`. LHN95 → LN02 ausschliesslich mit GeoSuite/REFRAME (HTRANS).
+- **Koordinaten in Grad** werden abgelehnt: aus CH1903+ (EPSG:4150) wäre die Projektion nach LV95
+  zwar exakt, aus WGS84/ETRS89 aber eine Datumstransformation – und die Werte allein verraten nicht,
+  welches von beiden vorliegt.
+- **Höhe:** **LN02** oder **LHN95** nach GUI-Auswahl, nur getaggt. Eine abweichende Angabe der
+  Quelle (Tag bzw. Dateiname) ergibt eine Warnung. Eine echte Umrechnung LHN95 ↔ LN02 macht
+  ausschliesslich GeoSuite/REFRAME (HTRANS).
+- **CRS-VLRs LV95/LHN95:** Es gibt keine verifizierte LHN95-Referenzkachel. Die zwei VLRs sind aus
+  der LN02-Referenz abgeleitet: nur der `VERT_CS`-Block im WKT (zeichengleich mit der GDAL/PROJ-
+  Definition von EPSG:5729) und der VerticalCSTypeGeoKey 4096 (5728 → 5729) sind ersetzt. Geprüft:
+  `pdal info` liest LV95 + LHN95, der WKT ist laut GDAL gleichwertig zu `EPSG:2056+5729`.
+  `gdalsrsinfo -o epsg` meldet für beide Varianten „EPSG:-1“ (70 %), weil es für ein
+  zusammengesetztes CRS keinen eigenen EPSG-Code gibt – bei der swissSURFACE3D-Referenz identisch.
 - **Grid-Shape** muss EPSG:2056 sein (wird geprüft).
 
 ---

@@ -1,4 +1,5 @@
 """Leichtgewichtige Import-/Sanity-Checks - laufen ohne OSGeo4W/PDAL."""
+import base64
 import importlib.util
 import os
 import struct
@@ -51,24 +52,27 @@ def test_detect_python_home_returns_string():
     assert isinstance(gui._detect_python_home(os.path.join("C:", "OSGeo4W", "bin", "python3.exe")), str)
 
 
-def test_output_base():
-    f = _runner()._output_base
-    assert f("2015_RHONE_DSM_1m_LV95_LN02_CIR_low_raw.asc") == "2015_RHONE_DSM_1m"
-    assert f("2015_RHONE_DSM_1m_2600_1200_LV95_LN02.laz") == "2015_RHONE_DSM_1m"   # alter 1km-Key
-    assert f("SURFACE_2010_1091-44_LV95_LN02.laz") == "SURFACE_2010"               # LK25-Blatt
-    assert f("dom_600_200.xyz") == "dom"                                             # LV03-km
-    assert f("dsm_2015_1.xyz") == "dsm_2015_1"                                       # Jahr ist kein Key
-    assert f("gebiet.xyz") == "gebiet"
+def test_naming_preview():
+    gui = _gui()
+    assert gui._naming_preview("2021", "DIABLONS", 0.2, "LN02", "laz") == \
+        "2021_DIABLONS_TIN_DSM_thin02_2600_1200_LV95_LN02.laz"
+    assert gui._naming_preview("", "", 0, "LHN95", "las", 1.0).splitlines() == [
+        "<Jahr>_<AREA>_TIN_DSM_2600_1200_LV95_LHN95.las",
+        "<Jahr>_<AREA>_DSM_100cm_LV95_LHN95.tif", "<Jahr>_<AREA>_hillshade_100cm_LV95_LHN95.tif"]
 
 
-def test_group_by_base_and_preview():
+def test_ascii_name_hints_and_metadata(tmp_path):
     r = _runner()
-    files = [os.path.join("x", "2015_RHONE_DSM_1m_LV95_LN02_CIR_low_raw.asc"),
-             os.path.join("x", "2016_AARE_DSM_1m_LV95_LN02_CIR_low_raw.asc")]
-    assert sorted(r._group_by_base(files)) == ["2015_RHONE_DSM_1m", "2016_AARE_DSM_1m"]
-    assert list(r._group_by_base(files, "MEIN_NAME")) == ["MEIN_NAME"]
-    preview = _gui()._naming_preview(files[:1])
-    assert "2015_RHONE_DSM_1m_2600_1200_LV95_LN02.laz" in preview
+    assert r._name_crs_hints("2015_RHONE_DSM_1m_LV95_LN02_CIR_low_raw.asc") == ["LV95", "LN02"]
+    assert r._name_crs_hints("dom_lv95_lhn95.xyz") == ["LV95", "LHN95"]
+    assert r._name_crs_hints("gebiet_2015.xyz") == []
+    assert r._source_height("x_LHN95.xyz", "ascii") == "LHN95"
+    p = tmp_path / "dsm_LV95_LHN95.xyz"
+    p.write_text("X Y Z\n" + "".join("%d 1200000.00 %d.25\n" % (2600000 + i, 500 + i) for i in range(10)))
+    s = r._sniff_ascii(str(p))
+    assert s["zrange_sample"] == [500.25, 509.25] and s["count_estimate"] == 10
+    m = r._ascii_metadata(str(p), s)
+    assert "LHN95" in m["crs_vertical"] and "LV95" in m["crs_horizontal"] and m["name_hints"] == "LV95, LHN95"
 
 
 def test_overlapping_pairs():
@@ -138,21 +142,121 @@ def test_read_las_header_and_lhn95_tag(tmp_path):
         assert r._lhn95_tagged(str(p)) is expected
 
 
+def test_las_tab_naming_and_choices():
+    r, gui = _runner(), _gui()
+    assert r._thin_token(0) == "" and r._thin_token(0.2) == "thin02" and r._thin_token(1.5) == "thin15"
+    assert r._las_tile_base("2021", "DIABLONS", 0.2) == "2021_DIABLONS_TIN_DSM_thin02"
+    assert r._las_tile_base("2021", "DIABLONS", 0) == "2021_DIABLONS_TIN_DSM"
+    assert r._raster_names("2021", "X", 0.5, "LN02") == ("2021_X_DSM_50cm_LV95_LN02.tif",
+                                                         "2021_X_hillshade_50cm_LV95_LN02.tif")
+    # GUI-Auswahllisten deckungsgleich mit dem Runner
+    assert set(gui.HEIGHT_LABELS) == set(r.HEIGHT_REFS)
+    assert tuple(v for _, v in gui.THIN_LABELS if v) == r.THIN_OPTIONS_M
+    assert tuple(gui.OUT_FORMAT_CHOICES) == r.OUT_FORMATS
+
+
+def test_target_point_format():
+    f = _runner()._target_point_format
+    assert f([0]) == f([1]) == f([6]) == 6
+    assert f([2]) == f([3]) == f([7]) == f([1, 3]) == 7
+    assert f([8]) == 8
+
+
+def test_reference_vlrs_lhn95_differ_only_in_height():
+    r = _runner()
+    keys_ln02, wkt_ln02 = r.REFERENCE_VLRS["LN02"]
+    keys_lhn95, wkt_lhn95 = r.REFERENCE_VLRS["LHN95"]
+    assert (keys_ln02, wkt_ln02) == (base64.b64decode(r.REFERENCE_VLR_34735_B64),
+                                     base64.b64decode(r.REFERENCE_VLR_2112_B64))   # LN02 byte-exakt
+    diff = [i for i in range(len(keys_ln02)) if keys_ln02[i] != keys_lhn95[i]]
+    assert len(keys_ln02) == len(keys_lhn95) and len(diff) <= 2                    # nur Key 4096
+    assert struct.unpack_from("<4H", keys_lhn95, 8 + 8 * 4) == (4096, 0, 1, 5729)
+    assert b'AUTHORITY["EPSG","5729"]]]' in wkt_lhn95 and b"LN02" not in wkt_lhn95
+    assert wkt_lhn95.split(b"VERT_CS")[0] == wkt_ln02.split(b"VERT_CS")[0]         # Lageteil identisch
+
+
+def test_vertical_tag_and_degree_range(tmp_path):
+    r = _runner()
+    p = tmp_path / "x.laz"
+    for wkt, expected in ((b'VERT_CS["LHN95 height",AUTHORITY["EPSG","5729"]]', "LHN95"),
+                          (b'VERT_CS["LN02 height",AUTHORITY["EPSG","5728"]]', "LN02"),
+                          (b'PROJCS["CH1903+ / LV95",AUTHORITY["EPSG","2056"]]', "")):
+        vlr = struct.pack("<H16sHH32s", 0, b"LASF_Projection", 2112, len(wkt), b"") + wkt
+        p.write_bytes(_las_bytes(1, vlr))
+        assert r._vertical_tag(str(p)) == expected
+    assert r._classify_crs(7.6, 46.1, 7.61, 46.11) == "GRAD"
+
+
 def test_process_action_available():
     r = _runner()
     assert callable(r._process) and callable(r._info)
 
 
-def test_format_ui_toggle():
+def test_tabs_per_format(tmp_path):
     gui = _gui()
     app = gui.DsmToLazApp()
     try:
-        app._fmt_var.set("las")
-        app._update_format_ui()
-        assert not app._ascii_sec.winfo_manager()
-        app._fmt_var.set("ascii")
-        app._update_format_ui()
-        assert app._ascii_sec.winfo_manager() == "pack"
-        assert app._base_var.get() == ""
+        nb = app._notebook
+        assert [nb.tab(t, "text") for t in nb.tabs()] == \
+            ["DSM.ascii → DSM.laz-Tiles", "DSM.laz → DSM.laz-Tiles"]
+        ascii_tab, las_tab = app._tabs["ascii"], app._tabs["las"]
+        assert ascii_tab._ascii_sec.winfo_manager() == "pack"
+        assert las_tab._ascii_sec is None
+
+        # Beide Tabs: dieselben Eingaben in derselben Reihenfolge (Gruppen 1-4)
+        for tab in (ascii_tab, las_tab):
+            headers = [w.cget("text") for w in tab._sf.winfo_children()
+                       if isinstance(w, gui.ttk.Label) and w.cget("text")[:1].isdigit()]
+            assert headers == ["1   Input", "2   Projekt & Referenzsystem", "3   Output",
+                               "4   Staging & Parallelisierung"]
+            for attr in ("_jahr_var", "_area_var", "_height_label_var", "_thin_label_var", "_out_fmt_var",
+                         "_raster_var", "_info_meta"):
+                assert hasattr(tab, attr), (tab.fmt, attr)
+
+        # ASCII-Tab: gleiche Benennung, Warnung bei abweichender Hoehenangabe im Dateinamen
+        ascii_tab._jahr_var.set("2015")
+        ascii_tab._area_var.set("RHONE")
+        assert ascii_tab._name_preview_lbl.cget("text") == "2015_RHONE_TIN_DSM_2600_1200_LV95_LN02.laz"
+        ascii_info = {"format": "ascii", "n_files": 1, "n_ascii": 1, "separator": "tab", "ncols": 3,
+                      "skip": 1, "columns": "X Y Z", "first_xy": [2600000, 1200000], "preview": ["X\tY\tZ"],
+                      "crs_guess": "LV95", "vertical_tags": {"LHN95": 1}, "target_pf": 6,
+                      "first_meta": {"file": "a_LHN95.xyz", "crs_vertical": "kein CRS-Tag (ASCII)  |  Dateiname: LHN95"}}
+        ascii_tab._show_info(ascii_info)
+        assert "im Dateinamen als LHN95" in ascii_tab._info_warn.cget("text")
+        assert "Dateiname: LHN95" in ascii_tab._info_meta.cget("text")
+        assert ascii_tab._sep_label_var.get() == gui.SEPARATOR_LABELS["tab"]
+        ascii_tab._sep_label_var.set(gui.SEPARATOR_LABELS["comma"])     # Benutzer korrigiert
+        ascii_tab._height_label_var.set(gui.HEIGHT_LABELS["LHN95"])
+        ascii_tab._on_height_changed()
+        assert not ascii_tab._info_warn.winfo_manager()
+        assert ascii_tab._sep_label_var.get() == gui.SEPARATOR_LABELS["comma"]   # nicht ueberschrieben
+
+        # LAZ-Tab: Benennung aus Jahr / AREA / Thinning / Hoehenbezug / Format
+        las_tab._jahr_var.set("2021")
+        las_tab._area_var.set("DIABLONS")
+        las_tab._thin_label_var.set("0.2 m")
+        las_tab._height_label_var.set(gui.HEIGHT_LABELS["LHN95"])
+        las_tab._on_height_changed()
+        las_tab._out_fmt_var.set("las")
+        assert las_tab._name_preview_lbl.cget("text") == "2021_DIABLONS_TIN_DSM_thin02_2600_1200_LV95_LHN95.las"
+        assert not las_tab._raster_frame.winfo_manager()          # Raster-Felder versteckt
+        las_tab._raster_var.set(True)
+        las_tab._update_raster_ui()
+        assert las_tab._raster_frame.winfo_manager() == "grid"
+        assert "2021_DIABLONS_DSM_50cm_LV95_LHN95.tif" in las_tab._name_preview_lbl.cget("text")
+
+        # Tag-Warnung folgt der Auswahl
+        info = {"format": "las", "n_files": 1, "n_las": 1, "vertical_tags": {"LN02": 1},
+                "extent": [2600000, 1200000, 2601000, 1201000], "crs_guess": "LV95",
+                "first_meta": {"file": "x.laz", "crs_vertical": "LN02 height (EPSG:5728)"}}
+        las_tab._show_info(info)
+        assert "als LN02 bezeichnet/getaggt, gewaehlt ist LHN95" in las_tab._info_warn.cget("text")
+        assert "LN02 height (EPSG:5728)" in las_tab._info_meta.cget("text")
+        las_tab._height_label_var.set(gui.HEIGHT_LABELS["LN02"])
+        las_tab._on_height_changed()
+        assert not las_tab._info_warn.winfo_manager()
+
+        app._set_start_buttons("disabled")
+        assert all(str(t._start_btn.cget("state")) == "disabled" for t in app._tabs.values())
     finally:
         app.destroy()

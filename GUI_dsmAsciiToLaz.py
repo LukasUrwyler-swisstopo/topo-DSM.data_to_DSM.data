@@ -1,10 +1,12 @@
 """
 GUI_dsmAsciiToLaz.py  –  DSM ASCII/LAZ → LAZ-Tiles GUI
-Tkinter-Oberflaeche fuer die Umwandlung alter DSM-Punktwolken:
-  - ASCII (xyz)          → LAZ + neues Tiling gemaess Grid-Shape (z.B. swissGRID 1km²)
-  - LAZ/LAS (altes Tiling) → LAZ, nur neues Tiling
-Dateiname je Kachel: <Basis>_<NAME>_LV95_LN02.laz (Basis aus dem Input-Dateinamen,
-NAME aus der Attributtabelle des Grids). Hoehen immer LN02, Lage immer LV95.
+Tkinter-Oberflaeche fuer die Umwandlung alter DSM-Punktwolken, je Input-Format ein Tab:
+  - DSM.ascii → DSM.laz-Tiles:  ASCII (xyz)                        → LAZ/LAS-Kacheln
+  - DSM.laz   → DSM.laz-Tiles:  LAZ/LAS (beliebiges Tiling/merged) → LAZ/LAS-Kacheln
+Beide Tabs: Tiling gemaess Grid-Shape, CRS-Tag LV95 + LN02/LHN95 nach Auswahl (nie umgerechnet),
+optional Thinning und DSM-Raster + Hillshade.
+Dateiname je Kachel: <Jahr>_<AREA>_TIN_DSM[_thinNN]_<NAME>_LV95_<LN02|LHN95>.<laz|las>
+(NAME aus der Attributtabelle des Grids).
 Styling analog zu topo-COGTIFFconverter / topo-DMCdataConverter.
 
 Das GUI laeuft mit Standard-Python (kein osgeo erforderlich, kompatibel ab 3.6).
@@ -41,10 +43,12 @@ DEFAULT_GRID_SHAPE  = os.path.join(SCRIPT_DIR, "swissGRID_1km2_shp", "chGRID_1km
 # ─── Auswahl-Listen ───────────────────────────────────────────────────────────
 ASCII_EXTENSIONS = (".xyz", ".txt", ".asc", ".csv")
 LAS_EXTENSIONS   = (".laz", ".las")
-FORMAT_LABELS = {
-    "ascii": "ASCII  (.xyz / .txt / .asc / .csv)  → LAZ + neues Tiling",
-    "las":   "LAZ / LAS  (altes Tiling)  → nur neues Tiling",
+# Ein Tab je Input-Format (Schluessel = 'format' im Runner)
+TAB_LABELS = {
+    "ascii": "DSM.ascii → DSM.laz-Tiles",
+    "las":   "DSM.laz → DSM.laz-Tiles",
 }
+FORMAT_NAMES = {"ascii": "ASCII", "las": "LAZ/LAS"}
 # Schluessel 1:1 wie _osgeo_runner.SEPARATORS
 SEPARATOR_LABELS = {
     "space":     "Leerzeichen",
@@ -53,6 +57,16 @@ SEPARATOR_LABELS = {
     "semicolon": "Semikolon  ( ; )",
 }
 EXAMPLE_TILE_NAME = "2600_1200"   # Beispiel-NAME fuer die Benennungs-Vorschau
+
+# ── nur LAZ-Tab ── Schluessel 1:1 wie _osgeo_runner.HEIGHT_REFS / THIN_OPTIONS_M / OUT_FORMATS
+HEIGHT_LABELS = {
+    "LN02":  "EPSG:2056 + 5728   (CH1903+ / LV95 + LN02)",
+    "LHN95": "EPSG:2056 + 5729   (CH1903+ / LV95 + LHN95)",
+}
+THIN_LABELS = [("kein Thinning", 0.0), ("0.1 m", 0.1), ("0.2 m", 0.2), ("0.4 m", 0.4),
+               ("0.8 m", 0.8), ("1 m", 1.0), ("1.5 m", 1.5), ("2 m", 2.0)]
+OUT_FORMAT_CHOICES = ("laz", "las")
+DEFAULT_GSD = "0.5"
 
 
 # ─── OSGeo4W Python / pdal.exe Erkennung ──────────────────────────────────────
@@ -147,20 +161,15 @@ def _runner_module():
     return _RUNNER_MODULE
 
 
-def _naming_preview(files: List[str], base_override: str = "", max_sets: int = 5) -> str:
-    """'Input -> Output-Muster' je Kachelsatz; Dateien mit gleicher Basis werden zusammengefuehrt."""
-    if not files:
-        return "–"
+def _naming_preview(jahr: str, area: str, thin_m: float, height_ref: str, out_format: str,
+                    raster_gsd=None) -> str:
+    """Benennungs-Vorschau (Regel im Runner) inkl. optionaler Raster-Namen."""
     runner = _runner_module()
-    groups = runner._group_by_base(files, base_override)
-    lines = []
-    for base, members in list(groups.items())[:max_sets]:
-        src = os.path.basename(members[0])
-        if len(members) > 1:
-            src += "  (+{} weitere, zusammengefuehrt)".format(len(members) - 1)
-        lines.append("{}\n  →  {}_{}{}.laz".format(src, base, EXAMPLE_TILE_NAME, runner.OUT_NAME_SUFFIX))
-    if len(groups) > max_sets:
-        lines.append("… {} weitere Kachelsaetze".format(len(groups) - max_sets))
+    jahr, area = jahr.strip() or "<Jahr>", area.strip() or "<AREA>"
+    lines = ["{}_{}{}.{}".format(runner._las_tile_base(jahr, area, thin_m), EXAMPLE_TILE_NAME,
+                                 runner._height_suffix(height_ref), out_format)]
+    if raster_gsd:
+        lines += list(runner._raster_names(jahr, area, raster_gsd, height_ref))
     return "\n".join(lines)
 
 
@@ -220,6 +229,603 @@ DARK = {
 }
 
 
+# ─── Tab 'DSM → LAZ-Tiles' (ein Input-Format je Tab) ──────────────────────────
+class TilesTab:
+    """Formular + Start fuer genau ein Input-Format ('ascii' oder 'las').
+    Log, Fortschritt, OSGeo4W-Python und Theme teilen sich alle Tabs ueber die App."""
+
+    def __init__(self, app, parent, fmt: str):
+        self.app = app
+        self.fmt = fmt
+        self._ascii_sec = None
+        self._last_info = None
+        self._build(parent)
+
+    # ── UI Aufbau ──────────────────────────────────────────────────────────────
+    # Reihenfolge = Arbeitsablauf: 1 Input lesen und pruefen -> 2 Projekt/CRS festlegen ->
+    # 3 Output (Ziel, Kachelung, Benennung, Raster) -> 4 Staging/Performance -> Start
+    def _build(self, parent):
+        sf = self._build_scrollable(parent)
+
+        self.app._build_group_header(sf, "1   Input")
+        self._build_input(sf)
+        self._build_dateiinfo(sf)
+        if self.fmt == "ascii":
+            self._build_ascii_options(sf)
+
+        self.app._build_group_header(sf, "2   Projekt & Referenzsystem")
+        self._build_projekt(sf)
+
+        self.app._build_group_header(sf, "3   Output")
+        self._build_output(sf)
+        self._build_raster_options(sf)
+
+        self.app._build_group_header(sf, "4   Staging & Parallelisierung")
+        self._build_staging(sf)
+
+        btn_row = ttk.Frame(parent)
+        btn_row.pack(fill="x", pady=(6, 0))
+        self._start_btn = ttk.Button(btn_row, text="▶   LAZ-TILES ERSTELLEN",
+                                      command=self._start)
+        self._start_btn.pack(side="right", ipadx=22, ipady=7)
+
+        for var in (self._jahr_var, self._area_var, self._thin_label_var, self._out_fmt_var,
+                    self._gsd_var):
+            var.trace_add("write", lambda *_: self._update_name_preview())
+        self._update_name_preview()
+
+    def _build_scrollable(self, parent):
+        """Scrollbarer Formular-Bereich (Canvas + vertikale Scrollbar)."""
+        outer = ttk.Frame(parent)
+        outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        sf     = ttk.Frame(canvas)
+        win_id = canvas.create_window((0, 0), window=sf, anchor="nw")
+        sf.bind("<Configure>",
+                lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(win_id, width=e.width))
+        self._canvas = canvas
+        self._sf     = sf
+        return sf
+
+    def _section(self, parent, title: str):
+        sec = ttk.LabelFrame(parent, text=title, padding=10, style="Section.TLabelframe")
+        sec.pack(fill="x", pady=(0, 6))
+        sec.columnconfigure(1, weight=1)
+        return sec
+
+    def _hint(self, parent, text: str, row: int, column: int = 1, columnspan: int = 1, pady=(0, 0)):
+        h = ttk.Label(parent, text=text, font=("", 8), justify="left", wraplength=560)
+        h.grid(row=row, column=column, columnspan=columnspan, sticky="w",
+               padx=(8, 0) if column else (0, 0), pady=pady)
+        self.app._dim_labels.append(h)
+        return h
+
+    @staticmethod
+    def _bold(parent, text: str, row: int, pady=3):
+        ttk.Label(parent, text=text, font=("Segoe UI", 9, "bold")).grid(row=row, column=0, sticky="w", pady=pady)
+
+    # ── 1 Input ────────────────────────────────────────────────────────────────
+    def _build_input(self, parent):
+        sec = self._section(parent, "Input-Daten")
+        self._bold(sec, "Input-Ordner:", 0)
+        self._in_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._in_var).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(sec, text="Ordner…", command=self._browse_input).grid(row=0, column=2, pady=3)
+        exts = ASCII_EXTENSIONS if self.fmt == "ascii" else LAS_EXTENSIONS
+        hint = "Alle {} im Ordner (nicht rekursiv) = EIN Kachelsatz  |  ".format("/".join(exts))
+        hint += ("typischerweise gemergt pro Gebiet" if self.fmt == "ascii"
+                 else "beliebiges Tiling oder ein merged.laz")
+        self._hint(sec, hint, 1)
+
+    def _build_dateiinfo(self, parent):
+        app = self.app
+        sec = self._section(parent, "Datei-Info  (aus dem Input-Ordner gelesen)")
+        fields = [
+            ("Dateien:",          "_info_files"),
+            ("Format / Version:", "_info_version"),
+            ("Punkte:",           "_info_count"),
+            ("Extent (X / Y):",   "_info_extent"),
+            ("Koordinatensys.:",  "_info_crs"),
+            ("Kacheln (max.):",   "_info_cells"),
+        ]
+        for row, (label, attr) in enumerate(fields):
+            ttk.Label(sec, text=label, font=("Segoe UI", 9, "bold")).grid(row=row, column=0, sticky="nw", pady=1)
+            val = ttk.Label(sec, text="–", font=("Segoe UI", 9), wraplength=540, justify="left")
+            val.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=1)
+            setattr(self, attr, val)
+            app._accent_labels.append(val)
+
+        r = len(fields)
+        ttk.Label(sec, text="Metadaten\n1. Datei:", font=("Segoe UI", 9, "bold"), justify="left"
+                  ).grid(row=r, column=0, sticky="nw", pady=(4, 1))
+        self._info_meta = ttk.Label(sec, text="–", font=("Courier New", 8), justify="left", wraplength=560)
+        self._info_meta.grid(row=r, column=1, sticky="w", padx=(8, 0), pady=(4, 1))
+        app._dim_labels.append(self._info_meta)
+        r += 1
+        if self.fmt == "ascii":
+            ttk.Label(sec, text="Vorschau:", font=("Segoe UI", 9, "bold")).grid(row=r, column=0, sticky="nw", pady=(4, 1))
+            self._info_preview = ttk.Label(sec, text="–", font=("Courier New", 8), justify="left")
+            self._info_preview.grid(row=r, column=1, sticky="w", padx=(8, 0), pady=(4, 1))
+            app._dim_labels.append(self._info_preview)
+            r += 1
+
+        self._info_warn = ttk.Label(sec, text="", font=("Segoe UI", 8, "italic"), wraplength=560, justify="left")
+        self._info_warn.grid(row=r, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self._info_warn.grid_remove()
+        app._hint_labels.append(self._info_warn)
+
+        ttk.Button(sec, text="Datei-Info aktualisieren", command=self._refresh_info
+                   ).grid(row=r + 1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+    def _build_ascii_options(self, parent):
+        self._ascii_sec = sec = self._section(parent, "ASCII-Format  (wie die Datei gelesen wird)")
+        self._bold(sec, "Spalten:", 0)
+        self._cols_var = tk.StringVar(value="X Y Z")
+        ttk.Entry(sec, textvariable=self._cols_var, width=40).grid(row=0, column=1, sticky="w", padx=(8, 0), pady=3)
+        self._hint(sec, "PDAL-Dimensionen in Datei-Reihenfolge, z.B.  X Y Z  oder  X Y Z Intensity "
+                        "Classification\nUnbekannte Namen (Col4 …) werden gelesen, aber nicht geschrieben", 1)
+        self._bold(sec, "Trennzeichen:", 2, pady=(8, 3))
+        self._sep_label_var = tk.StringVar(value=SEPARATOR_LABELS["space"])
+        ttk.Combobox(sec, textvariable=self._sep_label_var, values=list(SEPARATOR_LABELS.values()),
+                     state="readonly", width=18).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+        self._bold(sec, "Kopfzeilen ueberspringen:", 3)
+        self._skip_var = tk.StringVar(value="0")
+        tk.Spinbox(sec, from_=0, to=50, textvariable=self._skip_var, width=6
+                   ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=3)
+        self._hint(sec, "Wird aus der ersten Datei vorbelegt (Datei-Info)", 4, column=0, columnspan=2, pady=(6, 0))
+
+    # ── 2 Projekt & Referenzsystem ────────────────────────────────────────────
+    def _build_projekt(self, parent):
+        sec = self._section(parent, "Projekt  (Benennung + CRS-Tag)")
+        self._bold(sec, "Jahr:", 0)
+        self._jahr_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._jahr_var, width=8).grid(row=0, column=1, sticky="w", padx=(8, 0), pady=3)
+        self._bold(sec, "AREA / AOI:", 1)
+        self._area_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._area_var, width=28).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=3)
+
+        self._bold(sec, "CRS / SRS:", 2, pady=(8, 3))
+        self._height_label_var = tk.StringVar(value=HEIGHT_LABELS["LN02"])
+        cb = ttk.Combobox(sec, textvariable=self._height_label_var, values=list(HEIGHT_LABELS.values()),
+                          state="readonly", width=44)
+        cb.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+        cb.bind("<<ComboboxSelected>>", lambda _: self._on_height_changed())
+        quelle = "die CRS-Angabe im Dateinamen" if self.fmt == "ascii" else "der CRS-Tag der Quelle"
+        self._hint(sec, "Wird als CRS-Tag gesetzt (Kachel-Header, DSM-Raster) - {} wird ignoriert, eine falsche "
+                        "Angabe so korrigiert.\nKoordinaten und Hoehen werden NICHT umgerechnet: die Quelle muss "
+                        "bereits in LV95 und im gewaehlten Hoehenbezug vorliegen.".format(quelle), 3)
+
+        self._bold(sec, "Thinning:", 4, pady=(8, 3))
+        self._thin_label_var = tk.StringVar(value=THIN_LABELS[0][0])
+        ttk.Combobox(sec, textvariable=self._thin_label_var, values=[l for l, _ in THIN_LABELS],
+                     state="readonly", width=16).grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+        self._hint(sec, "Mindestabstand zwischen den Punkten (filters.sample, wie topo-DMCdataConverter) - "
+                        "im Namen als _thin<dm>, z.B. 0.2 m -> _thin02", 5)
+
+    # ── 3 Output ───────────────────────────────────────────────────────────────
+    def _build_output(self, parent):
+        app = self.app
+        sec = self._section(parent, "Kachel-Output")
+        self._bold(sec, "Output-Ordner:", 0)
+        self._out_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._out_var).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(sec, text="Ordner…", command=self._browse_output).grid(row=0, column=2, pady=3)
+        self._hint(sec, "Je Grid-Zelle mit Daten eine Kachel  |  muss ein anderer Ordner als der Input sein", 1)
+
+        self._bold(sec, "Format:", 2, pady=(8, 3))
+        self._out_fmt_var = tk.StringVar(value=OUT_FORMAT_CHOICES[0])
+        ttk.Combobox(sec, textvariable=self._out_fmt_var, values=list(OUT_FORMAT_CHOICES),
+                     state="readonly", width=6).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+        self._hint(sec, "laz = LASzip-komprimiert (GDWH-Standard)  |  las = unkomprimiert", 3)
+
+        self._bold(sec, "Grid-Shape (.shp):", 4, pady=(8, 3))
+        self._grid_var = tk.StringVar(value=DEFAULT_GRID_SHAPE if os.path.isfile(DEFAULT_GRID_SHAPE) else "")
+        ttk.Entry(sec, textvariable=self._grid_var).grid(row=4, column=1, sticky="ew", padx=(8, 4), pady=(8, 3))
+        ttk.Button(sec, text="Datei…", command=self._browse_grid_shape).grid(row=4, column=2, pady=(8, 3))
+        self._hint(sec, "Attributfeld 'NAME' = TileKey  |  regelmaessiges LV95-Grid (EPSG:2056), z.B. swissGRID 1km²", 5)
+
+        ttk.Label(sec, text="Benennung:", font=("Segoe UI", 9, "bold")).grid(row=6, column=0, sticky="nw", pady=(10, 3))
+        self._name_preview_lbl = ttk.Label(sec, text="–", font=("Courier New", 9), justify="left")
+        self._name_preview_lbl.grid(row=6, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(10, 3))
+        app._accent_labels.append(self._name_preview_lbl)
+        self._hint(sec, "<Jahr>_<AREA>_TIN_DSM[_thinNN]_<NAME>_LV95_<LN02|LHN95>  (Beispiel NAME = {})"
+                   .format(EXAMPLE_TILE_NAME), 7)
+        pf = ("PF6 (PF7 bei Spalten Red/Green/Blue)" if self.fmt == "ascii"
+              else "PF6 (PF7 bei RGB, PF8 bei NIR - nach den Feldern der Quelle)")
+        self._hint(sec, "Zielformat (GDWH, wie swissSURFACE3D): LAS 1.4 · {} · scale 0.01 · Offset = "
+                        "Kachelursprung · global_encoding 17 · CRS-VLRs 34735 + 2112".format(pf),
+                   8, column=0, columnspan=3, pady=(8, 0))
+
+    def _build_raster_options(self, parent):
+        sec = self._section(parent, "DSM-Raster  (optional)")
+        self._raster_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(sec, text="Create DSM-Raster  (+ Hillshade) aus den neuen Kacheln",
+                        variable=self._raster_var, command=self._update_raster_ui
+                        ).grid(row=0, column=0, columnspan=3, sticky="w")
+
+        # Nur sichtbar, wenn die Option aktiv ist
+        self._raster_frame = rf = ttk.Frame(sec)
+        rf.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        rf.columnconfigure(1, weight=1)
+        self._bold(rf, "Raster-Output-Ordner:", 0)
+        self._raster_dir_var = tk.StringVar()
+        ttk.Entry(rf, textvariable=self._raster_dir_var).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(rf, text="Ordner…", command=self._browse_raster_dir).grid(row=0, column=2, pady=3)
+        self._bold(rf, "Aufloesung (GSD) [m]:", 1)
+        self._gsd_var = tk.StringVar(value=DEFAULT_GSD)
+        ttk.Entry(rf, textvariable=self._gsd_var, width=8).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=3)
+        self._hint(rf, "IDW je Zelle, kleine Loecher (<= 900 m²) interpoliert, NoData wo keine Punkte liegen\n"
+                       "DSM: Float32, NoData -3.4028235e+38, CRS LV95 + Hoehe  |  Hillshade: Byte, NoData 255, "
+                       "CRS LV95  |  je .tif + .tfw", 2, column=0, columnspan=3, pady=(4, 0))
+        self._update_raster_ui()
+
+    def _update_raster_ui(self):
+        if self._raster_var.get():
+            self._raster_frame.grid()
+        else:
+            self._raster_frame.grid_remove()
+        self._update_name_preview()
+
+    def _browse_raster_dir(self):
+        path = filedialog.askdirectory(title="Output-Ordner fuer DSM-Raster + Hillshade auswaehlen")
+        if path:
+            self._raster_dir_var.set(path.replace("/", "\\"))
+
+    def _height_ref(self) -> str:
+        return next((k for k, v in HEIGHT_LABELS.items() if v == self._height_label_var.get()), "LN02")
+
+    def _thin_m(self) -> float:
+        return next((v for l, v in THIN_LABELS if l == self._thin_label_var.get()), 0.0)
+
+    def _on_height_changed(self):
+        self._update_name_preview()
+        if self._last_info:
+            self._show_info(self._last_info)   # Warnung zur Hoehenangabe gegen die neue Auswahl pruefen
+
+    # ── 4 Staging & Parallelisierung ──────────────────────────────────────────
+    def _build_staging(self, parent):
+        sec = self._section(parent, "Staging & Parallelisierung")
+        self._bold(sec, "Staging-Ordner:", 0)
+        self._staging_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._staging_var).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(sec, text="Ordner…", command=self._browse_staging).grid(row=0, column=2, pady=3)
+        inhalt = "ASCII→LAZ, Kachelstuecke, Raster-Zellen" if self.fmt == "ascii" else "Kachelstuecke, Raster-Zellen"
+        self._hint(sec, "Leer = <Output-Ordner>\\_staging  |  Zwischendateien ({}), Platzbedarf etwa "
+                        "Datenmenge als LAZ".format(inhalt), 1)
+
+        self._bold(sec, "CPU-Kerne:", 2, pady=(8, 3))
+        cpu_max = max(1, os.cpu_count() or 4)
+        self._workers_var = tk.StringVar(value=str(min(4, cpu_max)))
+        tk.Spinbox(sec, from_=1, to=cpu_max, textvariable=self._workers_var, width=6
+                   ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+
+        self._keep_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(sec, text="Staging-Dateien nach Abschluss behalten (nicht loeschen)",
+                        variable=self._keep_var).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    # ── Benennung ─────────────────────────────────────────────────────────────
+    def _update_name_preview(self):
+        if getattr(self, "_name_preview_lbl", None) is None:
+            return
+        gsd = None
+        if self._raster_var.get():
+            try:
+                gsd = float(self._gsd_var.get().replace(",", "."))
+            except ValueError:
+                gsd = None
+        try:
+            text = _naming_preview(self._jahr_var.get(), self._area_var.get(), self._thin_m(),
+                                   self._height_ref(), self._out_fmt_var.get(),
+                                   gsd if gsd and gsd > 0 else None)
+        except Exception as e:
+            text = "(Vorschau nicht moeglich: {})".format(e)
+        self._name_preview_lbl.config(text=text)
+
+    # ── Browse-Helfer ─────────────────────────────────────────────────────────
+    def _browse_input(self):
+        path = filedialog.askdirectory(title="Input-Ordner ({}) auswaehlen".format(FORMAT_NAMES[self.fmt]))
+        if not path:
+            return
+        path = path.replace("/", "\\")
+        self._in_var.set(path)
+        if not self._out_var.get().strip():
+            p = Path(path)
+            self._out_var.set(str(p.parent / (p.name + "_LAZ_tiles")))
+        self._update_name_preview()
+        self.app._clear_log()
+        self._refresh_info()
+
+    def _browse_output(self):
+        path = filedialog.askdirectory(title="Output-Ordner (LAZ-Kacheln) auswaehlen")
+        if path:
+            self._out_var.set(path.replace("/", "\\"))
+
+    def _browse_grid_shape(self):
+        current   = self._grid_var.get().strip()
+        start_dir = os.path.dirname(current) if current and os.path.isfile(current) \
+                    else os.path.dirname(DEFAULT_GRID_SHAPE)
+        kwargs = {"title": "Grid-Shape auswaehlen",
+                  "filetypes": [("Shapefile", "*.shp"), ("Alle Dateien", "*.*")]}
+        if os.path.isdir(start_dir):
+            kwargs["initialdir"] = start_dir
+        path = filedialog.askopenfilename(**kwargs)
+        if path:
+            self._grid_var.set(path.replace("/", "\\"))
+
+    def _browse_staging(self):
+        path = filedialog.askdirectory(title="Staging-Ordner auswaehlen")
+        if path:
+            self._staging_var.set(path.replace("/", "\\"))
+
+    # ── Datei-Info via Runner ──────────────────────────────────────────────────
+    def _reset_info(self):
+        for attr in ("_info_files", "_info_version", "_info_count", "_info_extent",
+                     "_info_crs", "_info_cells", "_info_preview", "_info_meta"):
+            if getattr(self, attr, None) is not None:
+                getattr(self, attr).config(text="–")
+        self._info_warn.grid_remove()
+        self._last_info = None
+
+    def _refresh_info(self):
+        src = self._in_var.get().strip()
+        self._reset_info()
+        if not src or not os.path.isdir(src):
+            return
+        osgeo_python = self.app._osgeo_python
+        if not osgeo_python or not os.path.isfile(osgeo_python):
+            self._info_files.config(text="OSGeo4W Python nicht gefunden – bitte Pfad setzen")
+            return
+
+        cfg = {"action": "info", "input_dir": src, "format": self.fmt,
+               "pdal_exe": self.app._pdal_exe, "grid_size": 1000}
+        self._info_files.config(text="wird gelesen…")
+
+        def ui_error(msg):
+            try:
+                from tkinter import messagebox
+                messagebox.showerror("Datei-Info Fehler", msg[-2000:], parent=self.app)
+            except Exception:
+                pass
+            self._reset_info()
+
+        def ui_info(info):
+            try:
+                self._show_info(info)
+            except Exception:
+                ui_error("Fehler beim Darstellen der Datei-Info:\n" + traceback.format_exc())
+
+        self.app._fetch_info_async(cfg, ui_info, ui_error)
+
+    def _show_info(self, info: dict):
+        T = DARK if self.app._dark else LIGHT
+        other = "las" if self.fmt == "ascii" else "ascii"
+        n = info.get("n_files", 0)
+        n_other = info.get("n_" + other, 0)
+        if not n:
+            text = "(keine {}-Dateien im Ordner)".format(FORMAT_NAMES[self.fmt])
+            if n_other:
+                text += "  –  {} {}-Datei(en) gefunden: Tab '{}' verwenden".format(
+                    n_other, FORMAT_NAMES[other], TAB_LABELS[other])
+            self._info_files.config(text=text)
+            return
+        self._info_files.config(text="{} Datei(en), {:.1f} MB  |  z.B. {}".format(
+            n, info.get("size_mb", 0.0), info.get("sample", "")))
+
+        warnings = []
+        if n_other:
+            warnings.append("ℹ  Ordner enthaelt auch {} {}-Datei(en) – dieser Tab verarbeitet nur die "
+                            "{}-Dateien.".format(n_other, FORMAT_NAMES[other], FORMAT_NAMES[self.fmt]))
+        first_show = self._last_info is not info   # Neu-Anzeige nach CRS-Wechsel: Eingaben nicht ueberschreiben
+        self._last_info = info
+        if self.fmt == "ascii":
+            sep = info.get("separator", "space")
+            self._info_version.config(text="ASCII  |  Trennzeichen: {}  |  {} Spalten  |  {} Kopfzeile(n)  →  "
+                                           "Ausgabe LAS 1.4 / PF{}".format(SEPARATOR_LABELS.get(sep, sep),
+                                                                           info.get("ncols"), info.get("skip"),
+                                                                           info.get("target_pf", "?")))
+            self._info_count.config(text="(1. Datei) " + str((info.get("first_meta") or {}).get("count", "–"))
+                                    + "  |  exakt erst nach dem Einlesen")
+            x, y = info.get("first_xy", [0, 0])
+            self._info_extent.config(text="1. Datenzeile:  {:.2f} / {:.2f}".format(x, y))
+            self._info_cells.config(text="– (erst nach dem Einlesen bekannt)")
+            self._info_preview.config(text="\n".join(line[:90] for line in info.get("preview", [])))
+            if first_show:
+                self._cols_var.set(info.get("columns", "X Y Z"))
+                self._sep_label_var.set(SEPARATOR_LABELS.get(sep, SEPARATOR_LABELS["space"]))
+                self._skip_var.set(str(info.get("skip", 0)))
+            where, missing = "im Dateinamen als", "ohne Hoehenangabe im Dateinamen"
+        else:
+            self._info_version.config(text="{}  →  Ausgabe LAS 1.4 / PF{}".format(
+                info.get("version", "–"), info.get("target_pf", "?")))
+            self._info_count.config(text="{:,}".format(info.get("count_total", 0)).replace(",", "'")
+                                    + "  (Summe aller Header)")
+            e = info.get("extent", [0, 0, 0, 0])
+            self._info_extent.config(text="{:.1f} – {:.1f}  /  {:.1f} – {:.1f}".format(e[0], e[2], e[1], e[3]))
+            self._info_cells.config(text="≤ {}  (aus den Header-BBoxen, leere Zellen fallen weg)".format(
+                info.get("n_cells_max", 0)))
+            where, missing = "als", "ohne Hoehen-Tag"
+        self._info_meta.config(text=self._format_meta(info.get("first_meta") or {}))
+
+        # Hoehenangabe der Quelle (LAS: CRS-Tag, ASCII: Dateiname) gegen die Auswahl - nur Warnung
+        chosen = self._height_ref()
+        for tag, count in sorted((info.get("vertical_tags") or {}).items()):
+            if tag == "ohne":
+                warnings.append("ℹ  {} Datei(en) {} → werden als {} getaggt.".format(count, missing, chosen))
+            elif tag != chosen:
+                warnings.append("⚠  {} Datei(en) sind {} {} bezeichnet/getaggt, gewaehlt ist {} – die Hoehen werden "
+                                "NICHT umgerechnet, nur als {} getaggt. Hoehenbezug der Quelle pruefen!".format(
+                                    count, where, tag, chosen, chosen))
+
+        crs = info.get("crs_guess", "unbekannt")
+        crs_text = {"LV95": "LV95 (EPSG:2056) – Koordinatenbereich plausibel",
+                    "LV03": "LV03 (EPSG:21781) – NICHT unterstuetzt",
+                    "GRAD": "Grad (geographisch) – NICHT unterstuetzt",
+                    }.get(crs, "unbekannt – Koordinaten weder LV95 noch LV03")
+        if self.fmt == "las":
+            crs_text += "  |  Tag 1. Datei: {}".format(info.get("crs_tag", "–"))
+        self._info_crs.config(text=crs_text, foreground=T["accent"] if crs == "LV95" else T["err"])
+        if crs == "LV03":
+            warnings.append("⚠  Koordinaten liegen in LV03 – zuerst mit GeoSuite/REFRAME (FINELTRA) "
+                            "nach LV95 transformieren; dieses Tool transformiert bewusst nicht.")
+        elif crs == "GRAD":
+            warnings.append("⚠  Koordinaten in Grad (z.B. CH1903+ EPSG:4150 oder WGS84) – zuerst nach LV95 "
+                            "projizieren; ein reiner Tag EPSG:2056 waere falsch.")
+        elif crs != "LV95":
+            hint = "Spalten-Reihenfolge / Trennzeichen pruefen." if self.fmt == "ascii" \
+                   else "Header-BBox der Dateien pruefen."
+            warnings.append("⚠  Koordinaten weder LV95 noch LV03 – " + hint)
+
+        if warnings:
+            self._info_warn.config(text="\n".join(warnings))
+            self._info_warn.grid()
+        else:
+            self._info_warn.grid_remove()
+
+    # Zeilen der Metadaten-Anzeige: LAS/LAZ aus 'pdal info --metadata', ASCII aus der Stichprobe
+    # (fehlende Schluessel werden ausgelassen)
+    _META_ROWS = [("file", "Datei"), ("size", "Groesse"), ("version", "Version"), ("count", "Punkte"),
+                  ("crs_horizontal", "Lage-CRS"), ("crs_vertical", "Hoehen-CRS"), ("name_hints", "Dateiname"),
+                  ("first_line", "1. Zeile"), ("zrange", "Z-Bereich"), ("scale", "scale"), ("offset", "offset"),
+                  ("global_encoding", "global_enc."), ("software", "Software"), ("vlrs", "VLRs"),
+                  ("dims", "Dimensionen")]
+
+    @classmethod
+    def _format_meta(cls, meta: dict) -> str:
+        """Metadaten der ersten Input-Datei als Textblock."""
+        if not meta:
+            return "–"
+        if meta.get("error"):
+            return "{}: nicht lesbar – {}".format(meta.get("file", ""), meta["error"][:300])
+        rows = []
+        for key, label in cls._META_ROWS:
+            if key not in meta:
+                continue
+            v = meta[key]
+            if key in ("scale", "offset"):
+                v = " / ".join("{:.10g}".format(x) if isinstance(x, (int, float)) else str(x) for x in v)
+            elif key == "count" and isinstance(v, (int, float)):
+                v = "{:,}".format(int(v)).replace(",", "'")
+            elif key == "vlrs":
+                v = ", ".join(v) or "–"
+            elif key == "dims":
+                v = " ".join(v) or "–"
+            elif key == "software" and meta.get("created"):
+                v = "{}  |  erstellt {}".format(v, meta["created"])
+            rows.append("{:<12}: {}".format(label, v))
+        return "\n".join(rows)
+
+    # ── Validierung ───────────────────────────────────────────────────────────
+    def _validate(self) -> bool:
+        app  = self.app
+        errors = []
+        inp  = self._in_var.get().strip()
+        out  = self._out_var.get().strip()
+        grid = self._grid_var.get().strip()
+
+        if not app._osgeo_python or not os.path.isfile(app._osgeo_python):
+            errors.append("OSGeo4W Python nicht gefunden.\n"
+                          "Bitte Pfad via 'Aendern…' festlegen  (z.B. C:\\OSGeo4W\\bin\\python3.exe).")
+        if not app._pdal_exe or not os.path.isfile(app._pdal_exe):
+            errors.append("pdal.exe nicht gefunden (Teil von OSGeo4W/QGIS) - erwartet neben dem "
+                          "OSGeo4W Python oder im PATH.")
+        if not inp:
+            errors.append("Input-Ordner fehlt.")
+        elif not os.path.isdir(inp):
+            errors.append("Input-Ordner nicht gefunden:\n  {}".format(inp))
+        elif not _list_input_files(inp, self.fmt):
+            errors.append("Keine {}-Dateien im Input-Ordner:\n  {}".format(FORMAT_NAMES[self.fmt], inp))
+        if not out:
+            errors.append("Output-Ordner fehlt.")
+        elif inp and os.path.normcase(os.path.abspath(inp)) == os.path.normcase(os.path.abspath(out)):
+            errors.append("Output-Ordner muss sich vom Input-Ordner unterscheiden.")
+        if not grid:
+            errors.append("Grid-Shape fehlt.")
+        elif not os.path.isfile(grid):
+            errors.append("Grid-Shape nicht gefunden:\n  {}".format(grid))
+        if self.fmt == "ascii":
+            cols = self._cols_var.get().split()
+            if not {"X", "Y", "Z"} <= set(cols):
+                errors.append("Spalten muessen X, Y und Z enthalten (z.B.  X Y Z).")
+            if not self._skip_var.get().strip().isdigit():
+                errors.append("Kopfzeilen ueberspringen: ganze Zahl >= 0 erwartet.")
+        if not re.fullmatch(r"\d{4}", self._jahr_var.get().strip()):
+            errors.append("Jahr: vierstellig erwartet (z.B. 2021).")
+        area = self._area_var.get().strip()
+        if not area:
+            errors.append("AREA / AOI fehlt.")
+        elif re.search(r'[<>:"/\\|?*\s]', area):
+            errors.append('AREA enthaelt Leerzeichen oder unzulaessige Zeichen  (< > : " / \\ | ? *).')
+        if self._raster_var.get():
+            try:
+                if float(self._gsd_var.get().replace(",", ".")) <= 0:
+                    raise ValueError
+            except ValueError:
+                errors.append("Raster-Aufloesung (GSD): Zahl > 0 erwartet (z.B. 0.5).")
+            if not self._raster_dir_var.get().strip():
+                errors.append("Raster-Output-Ordner fehlt (Option 'Create DSM-Raster').")
+        try:
+            if int(self._workers_var.get()) < 1:
+                raise ValueError
+        except Exception:
+            errors.append("CPU-Kerne ungueltig.")
+
+        from tkinter import messagebox
+        if errors:
+            messagebox.showerror("Eingabe-Fehler", "\n\n".join("• " + e for e in errors), parent=app)
+            return False
+
+        existing = _list_input_files(out, "las") if os.path.isdir(out) else []
+        if existing and not messagebox.askyesno(
+                "Output-Ordner nicht leer",
+                "Der Output-Ordner enthaelt bereits {} LAZ/LAS-Datei(en).\n"
+                "Gleichnamige Kacheln werden ueberschrieben.\n\nFortfahren?".format(len(existing)),
+                parent=app):
+            return False
+        return True
+
+    # ── Verarbeitung starten ──────────────────────────────────────────────────
+    def _start(self):
+        if self.app._running or not self._validate():
+            return
+
+        inp = self._in_var.get().strip()
+        cfg = {
+            "action":          "process",
+            "input_dir":       inp,
+            "output_dir":      self._out_var.get().strip(),
+            "grid_shape_path": self._grid_var.get().strip(),
+            "format":          self.fmt,
+            "jahr":            self._jahr_var.get().strip(),
+            "area":            self._area_var.get().strip(),
+            "height_ref":      self._height_ref(),
+            "thin_m":          self._thin_m(),
+            "out_format":      self._out_fmt_var.get(),
+            "create_raster":   bool(self._raster_var.get()),
+            "raster_dir":      self._raster_dir_var.get().strip(),
+            "gsd":             float(self._gsd_var.get().replace(",", ".") or DEFAULT_GSD)
+                               if self._raster_var.get() else float(DEFAULT_GSD),
+            "staging_dir":     self._staging_var.get().strip(),
+            "num_workers":     int(self._workers_var.get()),
+            "keep_staging":    bool(self._keep_var.get()),
+            "pdal_exe":        self.app._pdal_exe,
+        }
+        if self.fmt == "ascii":
+            sep_key = next((k for k, v in SEPARATOR_LABELS.items() if v == self._sep_label_var.get()), "space")
+            cfg.update({
+                "columns":   " ".join(self._cols_var.get().split()),
+                "separator": sep_key,
+                "skip":      int(self._skip_var.get().strip() or 0),
+            })
+
+        self.app._start_run(cfg, "{}_to_laz".format(Path(inp).name), TAB_LABELS[self.fmt])
+
+
 # ─── Haupt-App ─────────────────────────────────────────────────────────────────
 class DsmToLazApp(tk.Tk):
 
@@ -241,6 +847,7 @@ class DsmToLazApp(tk.Tk):
         self._dim_labels    = []
         self._accent_labels = []
         self._hint_labels   = []
+        self._tabs          = {}   # type: Dict[str, TilesTab]
 
         self._osgeo_python = _detect_osgeo_python()
         self._osgeo_lbl    = None
@@ -283,12 +890,16 @@ class DsmToLazApp(tk.Tk):
         ttk.Button(self._osgeo_frame, text="Aendern…",
                     command=self._set_osgeo_python).pack(side="right")
 
-        # Tabs (vorerst einer - Aufbau identisch zu den Schwesterprojekten)
+        # Tabs: je Input-Format einer
+        # Mausrad soll ueberall im Formular scrollen, nicht nur ueber der leeren Canvas-Flaeche
+        self.bind_class("TCombobox", "<MouseWheel>", self._fwd_wheel)
+        self.bind_all("<MouseWheel>", self._fwd_wheel)
         self._notebook = ttk.Notebook(self)
         self._notebook.pack(fill="both", expand=True, padx=12, pady=6)
-        tab_tiles = ttk.Frame(self._notebook)
-        self._notebook.add(tab_tiles, text="DSM → LAZ-Tiles")
-        self._build_tiles_tab(tab_tiles)
+        for fmt, label in TAB_LABELS.items():
+            frame = ttk.Frame(self._notebook)
+            self._notebook.add(frame, text=label)
+            self._tabs[fmt] = TilesTab(self, frame, fmt)
 
         # Log
         ttk.Separator(self).pack(fill="x", padx=12, pady=4)
@@ -314,25 +925,6 @@ class DsmToLazApp(tk.Tk):
         ttk.Button(self._btn_row, text="Log loeschen",
                     command=self._clear_log).pack(side="right")
 
-    def _build_scrollable(self, parent, canvas_attr: str, frame_attr: str):
-        """Scrollbarer Formular-Bereich (Canvas + vertikale Scrollbar)."""
-        outer = ttk.Frame(parent)
-        outer.pack(fill="both", expand=True)
-        canvas = tk.Canvas(outer, highlightthickness=0)
-        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        sf     = ttk.Frame(canvas)
-        win_id = canvas.create_window((0, 0), window=sf, anchor="nw")
-        sf.bind("<Configure>",
-                lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfig(win_id, width=e.width))
-        setattr(self, canvas_attr, canvas)
-        setattr(self, frame_attr, sf)
-        return sf
-
     def _build_group_header(self, parent, text):
         """Visueller Zwischentitel zur thematischen Gruppierung."""
         lbl = ttk.Label(parent, text=text, font=("Segoe UI", 10, "bold"))
@@ -340,397 +932,7 @@ class DsmToLazApp(tk.Tk):
         self._accent_labels.append(lbl)
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=(0, 6))
 
-    def _build_tiles_tab(self, parent):
-        # Mausrad soll ueberall im Formular scrollen, nicht nur ueber der leeren Canvas-Flaeche
-        self.bind_class("TCombobox", "<MouseWheel>", self._fwd_wheel)
-        self.bind_all("<MouseWheel>", self._fwd_wheel)
-
-        sf = self._build_scrollable(parent, "_canvas", "_sf")
-
-        self._build_group_header(sf, "Input / Output")
-        self._build_dateien(sf)
-        self._build_dateiinfo(sf)
-
-        # Container bleibt immer gepackt -> ASCII-Sektion behaelt ihre Position beim Ein-/Ausblenden
-        self._ascii_container = ttk.Frame(sf)
-        self._ascii_container.pack(fill="x")
-        self._build_ascii_options(self._ascii_container)
-
-        self._build_group_header(sf, "Output-Parameter")
-        self._build_output_options(sf)
-
-        self._build_group_header(sf, "Staging & Parallelisierung")
-        self._build_staging(sf)
-
-        btn_row = ttk.Frame(parent)
-        btn_row.pack(fill="x", pady=(6, 0))
-        self._start_btn = ttk.Button(btn_row, text="▶   LAZ-TILES ERSTELLEN",
-                                      command=self._start)
-        self._start_btn.pack(side="right", ipadx=22, ipady=7)
-
-        self._update_format_ui()
-
-    def _build_dateien(self, parent):
-        sec = ttk.LabelFrame(parent, text="Dateien", padding=10,
-                              style="Section.TLabelframe")
-        sec.pack(fill="x", pady=(0, 6))
-        sec.columnconfigure(1, weight=1)
-
-        lbl = ttk.Label(sec, text="Input-Ordner:", font=("Segoe UI", 9, "bold"))
-        lbl.grid(row=0, column=0, sticky="w", pady=3)
-        self._in_var = tk.StringVar()
-        ttk.Entry(sec, textvariable=self._in_var
-                   ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
-        ttk.Button(sec, text="Ordner…", command=self._browse_input
-                    ).grid(row=0, column=2, pady=3)
-        h = ttk.Label(sec, text="Alle .xyz/.txt/.asc/.csv bzw. .laz/.las im Ordner (nicht rekursiv)",
-                       font=("", 8))
-        h.grid(row=1, column=1, sticky="w", padx=(8, 0))
-        self._dim_labels.append(h)
-
-        lbl_f = ttk.Label(sec, text="Input-Format:", font=("Segoe UI", 9, "bold"))
-        lbl_f.grid(row=2, column=0, sticky="w", pady=(8, 3))
-        self._fmt_var       = tk.StringVar(value="ascii")
-        self._fmt_label_var = tk.StringVar(value=FORMAT_LABELS["ascii"])
-        fmt_combo = ttk.Combobox(sec, textvariable=self._fmt_label_var,
-                                  values=list(FORMAT_LABELS.values()), state="readonly", width=52)
-        fmt_combo.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
-        fmt_combo.bind("<<ComboboxSelected>>", lambda _: self._on_format_selected())
-        h_f = ttk.Label(sec, text="Wird aus den Dateiendungen im Input-Ordner vorgewaehlt",
-                         font=("", 8))
-        h_f.grid(row=3, column=1, sticky="w", padx=(8, 0))
-        self._dim_labels.append(h_f)
-
-        lbl2 = ttk.Label(sec, text="Output-Ordner:", font=("Segoe UI", 9, "bold"))
-        lbl2.grid(row=4, column=0, sticky="w", pady=(8, 3))
-        self._out_var = tk.StringVar()
-        ttk.Entry(sec, textvariable=self._out_var
-                   ).grid(row=4, column=1, sticky="ew", padx=(8, 4), pady=(8, 3))
-        ttk.Button(sec, text="Ordner…", command=self._browse_output
-                    ).grid(row=4, column=2, pady=(8, 3))
-        h2 = ttk.Label(sec, text="Je Grid-Zelle mit Daten eine LAZ-Kachel  |  muss ein anderer Ordner "
-                                  "als der Input sein", font=("", 8))
-        h2.grid(row=5, column=1, sticky="w", padx=(8, 0))
-        self._dim_labels.append(h2)
-
-        lbl3 = ttk.Label(sec, text="Grid-Shape (.shp):", font=("Segoe UI", 9, "bold"))
-        lbl3.grid(row=6, column=0, sticky="w", pady=(8, 3))
-        self._grid_var = tk.StringVar(value=DEFAULT_GRID_SHAPE if os.path.isfile(DEFAULT_GRID_SHAPE) else "")
-        ttk.Entry(sec, textvariable=self._grid_var
-                   ).grid(row=6, column=1, sticky="ew", padx=(8, 4), pady=(8, 3))
-        ttk.Button(sec, text="Datei…", command=self._browse_grid_shape
-                    ).grid(row=6, column=2, pady=(8, 3))
-        h3 = ttk.Label(sec, text="Attributfeld 'NAME' = neuer TileKey  |  regelmaessiges LV95-Grid "
-                                  "(EPSG:2056), z.B. swissGRID 1km²", font=("", 8))
-        h3.grid(row=7, column=1, sticky="w", padx=(8, 0))
-        self._dim_labels.append(h3)
-
-    def _build_dateiinfo(self, parent):
-        sec = ttk.LabelFrame(parent, text="Datei-Info  (aus Input-Ordner gelesen)",
-                              padding=10, style="Section.TLabelframe")
-        sec.pack(fill="x", pady=(0, 6))
-        sec.columnconfigure(1, weight=1)
-
-        fields = [
-            ("Dateien:",          "_info_files"),
-            ("Format / Version:", "_info_version"),
-            ("Punkte:",           "_info_count"),
-            ("Extent (X / Y):",   "_info_extent"),
-            ("Koordinatensys.:",  "_info_crs"),
-            ("Kacheln (max.):",   "_info_cells"),
-        ]
-        for row, (label, attr) in enumerate(fields):
-            lbl = ttk.Label(sec, text=label, font=("Segoe UI", 9, "bold"))
-            lbl.grid(row=row, column=0, sticky="nw", pady=1)
-            val = ttk.Label(sec, text="–", font=("Segoe UI", 9), wraplength=540, justify="left")
-            val.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=1)
-            setattr(self, attr, val)
-            self._accent_labels.append(val)
-
-        r = len(fields)
-        lbl_p = ttk.Label(sec, text="Vorschau:", font=("Segoe UI", 9, "bold"))
-        lbl_p.grid(row=r, column=0, sticky="nw", pady=(4, 1))
-        self._info_preview = ttk.Label(sec, text="–", font=("Courier New", 8), justify="left")
-        self._info_preview.grid(row=r, column=1, sticky="w", padx=(8, 0), pady=(4, 1))
-        self._dim_labels.append(self._info_preview)
-
-        self._info_warn = ttk.Label(sec, text="", font=("Segoe UI", 8, "italic"),
-                                     wraplength=560, justify="left")
-        self._info_warn.grid(row=r + 1, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        self._info_warn.grid_remove()
-        self._hint_labels.append(self._info_warn)
-
-        ttk.Button(sec, text="Datei-Info aktualisieren", command=self._refresh_info
-                    ).grid(row=r + 2, column=0, columnspan=2, sticky="w", pady=(8, 0))
-
-    def _build_ascii_options(self, parent):
-        self._ascii_sec = ttk.LabelFrame(parent, text="ASCII-Format", padding=10,
-                                          style="Section.TLabelframe")
-        self._ascii_sec.pack(fill="x", pady=(0, 6))
-        sec = self._ascii_sec
-        sec.columnconfigure(1, weight=1)
-
-        lbl = ttk.Label(sec, text="Spalten:", font=("Segoe UI", 9, "bold"))
-        lbl.grid(row=0, column=0, sticky="w", pady=3)
-        self._cols_var = tk.StringVar(value="X Y Z")
-        ttk.Entry(sec, textvariable=self._cols_var, width=40
-                   ).grid(row=0, column=1, sticky="w", padx=(8, 0), pady=3)
-        h = ttk.Label(sec, text="PDAL-Dimensionen in Datei-Reihenfolge, z.B.  X Y Z  oder  "
-                                 "X Y Z Intensity Classification\nUnbekannte Namen (Col4 …) werden "
-                                 "gelesen, aber nicht in die LAZ geschrieben", font=("", 8), justify="left")
-        h.grid(row=1, column=1, sticky="w", padx=(8, 0))
-        self._dim_labels.append(h)
-
-        lbl2 = ttk.Label(sec, text="Trennzeichen:", font=("Segoe UI", 9, "bold"))
-        lbl2.grid(row=2, column=0, sticky="w", pady=(8, 3))
-        self._sep_label_var = tk.StringVar(value=SEPARATOR_LABELS["space"])
-        ttk.Combobox(sec, textvariable=self._sep_label_var, values=list(SEPARATOR_LABELS.values()),
-                     state="readonly", width=18
-                     ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
-
-        lbl3 = ttk.Label(sec, text="Kopfzeilen ueberspringen:", font=("Segoe UI", 9, "bold"))
-        lbl3.grid(row=3, column=0, sticky="w", pady=3)
-        self._skip_var = tk.StringVar(value="0")
-        tk.Spinbox(sec, from_=0, to=50, textvariable=self._skip_var, width=6
-                   ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=3)
-
-        h2 = ttk.Label(sec, text="Werden aus der ersten Datei vorbelegt (Datei-Info)  |  X/Y muessen "
-                                  "in LV95 (EPSG:2056) vorliegen", font=("", 8))
-        h2.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self._dim_labels.append(h2)
-
-    def _build_output_options(self, parent):
-        sec = ttk.LabelFrame(parent, text="Kachel-Output", padding=10,
-                              style="Section.TLabelframe")
-        sec.pack(fill="x", pady=(0, 6))
-        sec.columnconfigure(1, weight=1)
-
-        crs_lbl = ttk.Label(sec, text="Output-Referenzsystem: EPSG:2056 + 5728  (LV95 / LN02)",
-                             font=("Segoe UI", 9, "bold"))
-        crs_lbl.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
-        self._accent_labels.append(crs_lbl)
-        h0 = ttk.Label(sec, text="Input muss bereits LV95 / LN02 sein - Koordinaten und Hoehen werden nicht "
-                                  "umgerechnet  |  LV03-Koordinaten und LHN95-Tags werden abgelehnt",
-                        font=("", 8), wraplength=560, justify="left")
-        h0.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        self._dim_labels.append(h0)
-
-        lbl_b = ttk.Label(sec, text="Basisname (optional):", font=("Segoe UI", 9, "bold"))
-        lbl_b.grid(row=2, column=0, sticky="w", pady=3)
-        self._base_var = tk.StringVar()
-        ttk.Entry(sec, textvariable=self._base_var, width=36
-                   ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=3)
-        h_b = ttk.Label(sec, text="Leer = automatisch je Input-Datei: Name bis vor '_LV95' (Rest wie "
-                                   "'_CIR_low_raw' faellt weg)\nGesetzt = gilt fuer alle Dateien, alle werden "
-                                   "zu EINEM Kachelsatz zusammengefuehrt", font=("", 8), justify="left")
-        h_b.grid(row=3, column=1, sticky="w", padx=(8, 0))
-        self._dim_labels.append(h_b)
-
-        lbl_v = ttk.Label(sec, text="Benennung:", font=("Segoe UI", 9, "bold"))
-        lbl_v.grid(row=4, column=0, sticky="nw", pady=(10, 3))
-        self._name_preview_lbl = ttk.Label(sec, text="–", font=("Courier New", 9), justify="left")
-        self._name_preview_lbl.grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(10, 3))
-        self._accent_labels.append(self._name_preview_lbl)
-
-        h_f = ttk.Label(sec, text="Zielformat (GDWH, wie swissSURFACE3D): <Basis>_<NAME>_LV95_LN02.laz · "
-                                   "LAS 1.4 / PF6 (PF7 falls RGB) · scale 0.01 · Offset = Kachelursprung · "
-                                   "global_encoding 17", font=("", 8), wraplength=560, justify="left")
-        h_f.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self._dim_labels.append(h_f)
-
-        for var in (self._base_var, self._in_var):
-            var.trace_add("write", lambda *_: self._update_name_preview())
-
-    def _build_staging(self, parent):
-        sec = ttk.LabelFrame(parent, text="Staging & Parallelisierung", padding=10,
-                              style="Section.TLabelframe")
-        sec.pack(fill="x", pady=(0, 6))
-        sec.columnconfigure(1, weight=1)
-
-        lbl = ttk.Label(sec, text="Staging-Ordner:", font=("Segoe UI", 9, "bold"))
-        lbl.grid(row=0, column=0, sticky="w", pady=3)
-        self._staging_var = tk.StringVar()
-        ttk.Entry(sec, textvariable=self._staging_var
-                   ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
-        ttk.Button(sec, text="Ordner…", command=self._browse_staging
-                    ).grid(row=0, column=2, pady=3)
-        h = ttk.Label(sec, text="Leer = <Output-Ordner>\\_staging  |  Zwischendateien (ASCII→LAZ, "
-                                 "Kachelstuecke), Platzbedarf etwa Datenmenge als LAZ", font=("", 8))
-        h.grid(row=1, column=1, sticky="w", padx=(8, 0))
-        self._dim_labels.append(h)
-
-        lbl2 = ttk.Label(sec, text="CPU-Kerne:", font=("Segoe UI", 9, "bold"))
-        lbl2.grid(row=2, column=0, sticky="w", pady=(8, 3))
-        cpu_max = max(1, os.cpu_count() or 4)
-        self._workers_var = tk.StringVar(value=str(min(4, cpu_max)))
-        tk.Spinbox(sec, from_=1, to=cpu_max, textvariable=self._workers_var, width=6
-                   ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
-
-        self._keep_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(sec, text="Staging-Dateien nach Abschluss behalten (nicht loeschen)",
-                         variable=self._keep_var
-                         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
-
-    # ── Format / Benennung ────────────────────────────────────────────────────
-    def _on_format_selected(self):
-        label = self._fmt_label_var.get()
-        for key, text in FORMAT_LABELS.items():
-            if text == label:
-                self._fmt_var.set(key)
-        self._update_format_ui()
-        self._refresh_info()
-
-    def _update_format_ui(self):
-        fmt = self._fmt_var.get()
-        self._fmt_label_var.set(FORMAT_LABELS.get(fmt, ""))
-        if fmt == "ascii":
-            self._ascii_sec.pack(fill="x", pady=(0, 6))
-        else:
-            self._ascii_sec.pack_forget()
-        self._update_name_preview()
-
-    def _update_name_preview(self):
-        if getattr(self, "_name_preview_lbl", None) is None:
-            return
-        files = _list_input_files(self._in_var.get().strip(), self._fmt_var.get())
-        try:
-            text = _naming_preview(files, self._base_var.get().strip())
-        except Exception as e:
-            text = "(Vorschau nicht moeglich: {})".format(e)
-        if files:
-            text += "\n(Beispiel NAME = {})".format(EXAMPLE_TILE_NAME)
-        self._name_preview_lbl.config(text=text)
-
-    # ── Browse-Helfer ─────────────────────────────────────────────────────────
-    def _browse_input(self):
-        path = filedialog.askdirectory(title="Input-Ordner (ASCII oder LAZ/LAS) auswaehlen")
-        if not path:
-            return
-        path = path.replace("/", "\\")
-        self._in_var.set(path)
-        n_ascii = len(_list_input_files(path, "ascii"))
-        n_las   = len(_list_input_files(path, "las"))
-        self._fmt_var.set("las" if n_las > n_ascii else "ascii")
-        self._update_format_ui()
-        if not self._out_var.get().strip():
-            p = Path(path)
-            self._out_var.set(str(p.parent / (p.name + "_LAZ_tiles")))
-        self._update_name_preview()
-        self._clear_log()
-        self._refresh_info()
-
-    def _browse_output(self):
-        path = filedialog.askdirectory(title="Output-Ordner (LAZ-Kacheln) auswaehlen")
-        if path:
-            self._out_var.set(path.replace("/", "\\"))
-
-    def _browse_grid_shape(self):
-        current   = self._grid_var.get().strip()
-        start_dir = os.path.dirname(current) if current and os.path.isfile(current) \
-                    else os.path.dirname(DEFAULT_GRID_SHAPE)
-        kwargs = {"title": "Grid-Shape auswaehlen",
-                  "filetypes": [("Shapefile", "*.shp"), ("Alle Dateien", "*.*")]}
-        if os.path.isdir(start_dir):
-            kwargs["initialdir"] = start_dir
-        path = filedialog.askopenfilename(**kwargs)
-        if path:
-            self._grid_var.set(path.replace("/", "\\"))
-
-    def _browse_staging(self):
-        path = filedialog.askdirectory(title="Staging-Ordner auswaehlen")
-        if path:
-            self._staging_var.set(path.replace("/", "\\"))
-
     # ── Datei-Info via Runner ──────────────────────────────────────────────────
-    def _reset_info(self):
-        for attr in ("_info_files", "_info_version", "_info_count", "_info_extent",
-                     "_info_crs", "_info_cells", "_info_preview"):
-            getattr(self, attr).config(text="–")
-        self._info_warn.grid_remove()
-
-    def _refresh_info(self):
-        src = self._in_var.get().strip()
-        self._reset_info()
-        if not src or not os.path.isdir(src):
-            return
-        if not self._osgeo_python or not os.path.isfile(self._osgeo_python):
-            self._info_files.config(text="OSGeo4W Python nicht gefunden – bitte Pfad setzen")
-            return
-
-        cfg = {"action": "info", "input_dir": src, "format": self._fmt_var.get(),
-               "pdal_exe": self._pdal_exe, "grid_size": 1000}
-        self._info_files.config(text="wird gelesen…")
-
-        def ui_error(msg):
-            try:
-                from tkinter import messagebox
-                messagebox.showerror("Datei-Info Fehler", msg[-2000:], parent=self)
-            except Exception:
-                pass
-            self._reset_info()
-
-        def ui_info(info):
-            try:
-                self._show_info(info)
-            except Exception:
-                ui_error("Fehler beim Darstellen der Datei-Info:\n" + traceback.format_exc())
-
-        self._fetch_info_async(cfg, ui_info, ui_error)
-
-    def _show_info(self, info: dict):
-        T = DARK if self._dark else LIGHT
-        fmt = info.get("format")
-        n = info.get("n_files", 0)
-        if not n:
-            self._info_files.config(text="(keine {}-Dateien im Ordner)".format(
-                "ASCII" if fmt == "ascii" else "LAZ/LAS"))
-            return
-        self._info_files.config(text="{} Datei(en), {:.1f} MB  |  z.B. {}".format(
-            n, info.get("size_mb", 0.0), info.get("sample", "")))
-
-        warnings = []
-        if info.get("n_ascii") and info.get("n_las"):
-            warnings.append("ℹ  Ordner enthaelt ASCII- UND LAZ/LAS-Dateien – verarbeitet wird nur "
-                            "das gewaehlte Input-Format.")
-        if fmt == "ascii":
-            sep = info.get("separator", "space")
-            self._info_version.config(text="ASCII  |  Trennzeichen: {}  |  {} Spalten  |  {} Kopfzeile(n)".format(
-                SEPARATOR_LABELS.get(sep, sep), info.get("ncols"), info.get("skip")))
-            self._info_count.config(text="– (erst nach dem Einlesen bekannt)")
-            x, y = info.get("first_xy", [0, 0])
-            self._info_extent.config(text="1. Datenzeile:  {:.2f} / {:.2f}".format(x, y))
-            self._info_preview.config(text="\n".join(line[:90] for line in info.get("preview", [])))
-            self._cols_var.set(info.get("columns", "X Y Z"))
-            self._sep_label_var.set(SEPARATOR_LABELS.get(sep, SEPARATOR_LABELS["space"]))
-            self._skip_var.set(str(info.get("skip", 0)))
-        else:
-            self._info_version.config(text=info.get("version", "–"))
-            self._info_count.config(text="{:,}".format(info.get("count_total", 0)).replace(",", "'")
-                                    + "  (Summe aller Header)")
-            e = info.get("extent", [0, 0, 0, 0])
-            self._info_extent.config(text="{:.1f} – {:.1f}  /  {:.1f} – {:.1f}".format(e[0], e[2], e[1], e[3]))
-            self._info_cells.config(text="≤ {}  (aus den Header-BBoxen, leere Zellen fallen weg)".format(
-                info.get("n_cells_max", 0)))
-            if info.get("has_rgb"):
-                warnings.append("ℹ  Quelle fuehrt Farbe (RGB) → Ausgabe als PF7 statt PF6.")
-
-        crs = info.get("crs_guess", "unbekannt")
-        crs_text = {"LV95": "LV95 (EPSG:2056) – Koordinatenbereich plausibel",
-                    "LV03": "LV03 (EPSG:21781) – NICHT unterstuetzt",
-                    }.get(crs, "unbekannt – Koordinaten weder LV95 noch LV03")
-        if fmt == "las":
-            crs_text += "  |  Tag: {}".format(info.get("crs_tag", "–"))
-        self._info_crs.config(text=crs_text, foreground=T["accent"] if crs == "LV95" else T["err"])
-        if crs == "LV03":
-            warnings.append("⚠  Koordinaten liegen in LV03 – zuerst mit GeoSuite/REFRAME (FINELTRA) "
-                            "nach LV95 transformieren; dieses Tool transformiert bewusst nicht.")
-        elif crs != "LV95":
-            warnings.append("⚠  Koordinaten weder LV95 noch LV03 – Spalten-Reihenfolge / Trennzeichen pruefen.")
-
-        if warnings:
-            self._info_warn.config(text="\n".join(warnings))
-            self._info_warn.grid()
-
     def _fetch_info_async(self, cfg: dict, on_info, on_error) -> None:
         """Ruft _osgeo_runner.py (Aktion 'info') als Subprocess auf; Ergebnis ueber
         on_info(dict) / on_error(msg) im UI-Thread."""
@@ -770,12 +972,14 @@ class DsmToLazApp(tk.Tk):
 
     # ── Hilfsfunktionen ────────────────────────────────────────────────────────
     def _fwd_wheel(self, event):
-        """Mausrad ueber beliebigen Formular-Widgets scrollt das Formular (nicht Combobox-Werte)."""
+        """Mausrad ueber beliebigen Formular-Widgets scrollt das Formular des jeweiligen Tabs
+        (nicht Combobox-Werte)."""
         w = event.widget
         while w is not None and not isinstance(w, str):
-            if w in (getattr(self, "_canvas", None), getattr(self, "_sf", None)):
-                self._canvas.yview_scroll(-1 * (event.delta // 120), "units")
-                break
+            for tab in self._tabs.values():
+                if w in (tab._canvas, tab._sf):
+                    tab._canvas.yview_scroll(-1 * (event.delta // 120), "units")
+                    return "break"
             w = getattr(w, "master", None)
         return "break"
 
@@ -877,7 +1081,8 @@ class DsmToLazApp(tk.Tk):
         self.option_add("*TCombobox*Listbox.selectForeground", T["sel_fg"])
 
         self.configure(bg=T["root"])
-        self._canvas.configure(bg=T["panel"], highlightbackground=T["sep"])
+        for tab in self._tabs.values():
+            tab._canvas.configure(bg=T["panel"], highlightbackground=T["sep"])
 
         self._hdr.configure(bg=T["hdr_bg"])
         self._hdr_lbl.configure(bg=T["hdr_bg"], fg=T["hdr_fg"])
@@ -968,9 +1173,14 @@ class DsmToLazApp(tk.Tk):
         except Exception:
             pass
 
+    def _set_start_buttons(self, state: str):
+        # Log und Fortschritt sind gemeinsam -> waehrend eines Laufs alle Tabs sperren
+        for tab in self._tabs.values():
+            tab._start_btn.config(state=state)
+
     def _on_done(self, success: bool):
         self._running = False
-        self._start_btn.config(state="normal")
+        self._set_start_buttons("normal")
         self._progress_bar.stop()
         self._progress_frame.pack_forget()
         self._log("\n✔  LAZ-Kacheln erfolgreich erstellt.\n" if success
@@ -983,96 +1193,16 @@ class DsmToLazApp(tk.Tk):
             messagebox.showerror("LAZ-Tiles fehlgeschlagen",
                                  "Verarbeitung ist fehlgeschlagen.\nDetails siehe Log-Ausgabe.", parent=self)
 
-    # ── Validierung ───────────────────────────────────────────────────────────
-    def _validate(self) -> bool:
-        errors = []
-        inp  = self._in_var.get().strip()
-        out  = self._out_var.get().strip()
-        grid = self._grid_var.get().strip()
-        fmt  = self._fmt_var.get()
-
-        if not self._osgeo_python or not os.path.isfile(self._osgeo_python):
-            errors.append("OSGeo4W Python nicht gefunden.\n"
-                          "Bitte Pfad via 'Aendern…' festlegen  (z.B. C:\\OSGeo4W\\bin\\python3.exe).")
-        if not self._pdal_exe or not os.path.isfile(self._pdal_exe):
-            errors.append("pdal.exe nicht gefunden (Teil von OSGeo4W/QGIS) - erwartet neben dem "
-                          "OSGeo4W Python oder im PATH.")
-        if not inp:
-            errors.append("Input-Ordner fehlt.")
-        elif not os.path.isdir(inp):
-            errors.append("Input-Ordner nicht gefunden:\n  {}".format(inp))
-        elif not _list_input_files(inp, fmt):
-            errors.append("Keine {}-Dateien im Input-Ordner:\n  {}".format(
-                "ASCII" if fmt == "ascii" else "LAZ/LAS", inp))
-        if not out:
-            errors.append("Output-Ordner fehlt.")
-        elif inp and os.path.normcase(os.path.abspath(inp)) == os.path.normcase(os.path.abspath(out)):
-            errors.append("Output-Ordner muss sich vom Input-Ordner unterscheiden.")
-        if not grid:
-            errors.append("Grid-Shape fehlt.")
-        elif not os.path.isfile(grid):
-            errors.append("Grid-Shape nicht gefunden:\n  {}".format(grid))
-        if fmt == "ascii":
-            cols = self._cols_var.get().split()
-            if not {"X", "Y", "Z"} <= set(cols):
-                errors.append("Spalten muessen X, Y und Z enthalten (z.B.  X Y Z).")
-            if not self._skip_var.get().strip().isdigit():
-                errors.append("Kopfzeilen ueberspringen: ganze Zahl >= 0 erwartet.")
-        if re.search(r'[<>:"/\\|?*]', self._base_var.get()):
-            errors.append('Basisname enthaelt unzulaessige Zeichen  (< > : " / \\ | ? *).')
-        try:
-            if int(self._workers_var.get()) < 1:
-                raise ValueError
-        except Exception:
-            errors.append("CPU-Kerne ungueltig.")
-
-        from tkinter import messagebox
-        if errors:
-            messagebox.showerror("Eingabe-Fehler", "\n\n".join("• " + e for e in errors), parent=self)
-            return False
-
-        existing = _list_input_files(out, "las") if os.path.isdir(out) else []
-        if existing and not messagebox.askyesno(
-                "Output-Ordner nicht leer",
-                "Der Output-Ordner enthaelt bereits {} LAZ/LAS-Datei(en).\n"
-                "Gleichnamige Kacheln werden ueberschrieben.\n\nFortfahren?".format(len(existing)),
-                parent=self):
-            return False
-        return True
-
     # ── Verarbeitung starten ──────────────────────────────────────────────────
-    def _start(self):
-        if self._running or not self._validate():
-            return
-
-        sep_key = next((k for k, v in SEPARATOR_LABELS.items() if v == self._sep_label_var.get()), "space")
-        inp = self._in_var.get().strip()
-        cfg = {
-            "action":          "process",
-            "input_dir":       inp,
-            "output_dir":      self._out_var.get().strip(),
-            "grid_shape_path": self._grid_var.get().strip(),
-            "format":          self._fmt_var.get(),
-            "columns":         " ".join(self._cols_var.get().split()),
-            "separator":       sep_key,
-            "skip":            int(self._skip_var.get().strip() or 0),
-            "base_name":       self._base_var.get().strip(),
-            "staging_dir":     self._staging_var.get().strip(),
-            "num_workers":     int(self._workers_var.get()),
-            "keep_staging":    bool(self._keep_var.get()),
-            "pdal_exe":        self._pdal_exe,
-        }
-
+    def _start_run(self, cfg: dict, log_stem: str, title: str):
         self._running = True
         self._progress_start = None
-        self._start_btn.config(state="disabled")
+        self._set_start_buttons("disabled")
         self._progress_frame.pack(fill="x", padx=12, pady=(0, 4), before=self._btn_row)
         self._progress_bar.config(mode="indeterminate")
         self._progress_bar.start(10)
         self._clear_log()
-        self._log("=== DSM → LAZ-Tiles gestartet ===\n\n")
-
-        log_stem = "{}_to_laz".format(Path(inp).name)
+        self._log("=== {} gestartet ===\n\n".format(title))
         threading.Thread(target=self._run_thread, args=(cfg, log_stem), daemon=True).start()
 
     def _run_thread(self, cfg: dict, log_stem: str):

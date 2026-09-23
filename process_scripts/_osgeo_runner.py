@@ -7,8 +7,9 @@ Ausgabe geht auf stdout -> wird vom GUI live im Log angezeigt.
 Aktionen:
     info    - Input-Ordner analysieren (Format, ASCII-Vorschau, Extent, CRS-Plausibilitaet),
               Ergebnis als JSON-Zeile auf stdout
-    process - ASCII (xyz) oder LAZ/LAS (altes Tiling) -> LAZ-Kacheln gemaess Grid-Shape
-              (Dateiname aus Attributfeld 'NAME'), siehe Kommentar ueber _process()
+    process - ASCII (xyz) oder LAZ/LAS (beliebiges Tiling / gemergt) -> LAZ/LAS-Kacheln gemaess
+              Grid-Shape (TileKey aus Attributfeld 'NAME'), CRS-Tag nach Auswahl, optional
+              Thinning und DSM-Raster + Hillshade, siehe Kommentar ueber _process()
 """
 
 import base64
@@ -44,22 +45,21 @@ FRAME_TOLERANCE_M    = 0.02   # Rundungsrauschen am Kachelrand nach Requantisier
 
 PC_FORMATS_WITH_RGB = (2, 3, 5, 7, 8, 10)
 
-# ─── Benennung der Kacheln ─────────────────────────────────────────────────────
-# <Basis>_<NAME>_LV95_LN02.laz. Basis = Input-Dateiname bis vor '_LV95' (der Rest wie
-# '_CIR_low_raw' faellt weg), ein alter TileKey am Ende der Basis wird entfernt:
-#   2015_RHONE_DSM_1m_LV95_LN02_CIR_low_raw.asc -> 2015_RHONE_DSM_1m_2600_1200_LV95_LN02.laz
-# Die Endung entspricht dem Muster des GDWH-Imports (4_SB_DSM_PUNKTWOLKE_LAS14upgrade.py).
-# Dateien mit gleicher Basis ergeben EINEN Kachelsatz (je Zelle zusammengefuehrt).
-OUT_NAME_SUFFIX = "_LV95_LN02"
-_LV95_MARKER    = re.compile(r"_LV95(?=[_.\s-]|$)", re.IGNORECASE)
-# Alter TileKey am Ende der Basis ('_2600_1200', '_1091-44', '_600_200'). Die erste Zahl
-# muss LV95-km (2480-2840), LK25-Blatt (1011-1374) oder LV03-km (480-840) sein, damit
-# z.B. ein Jahr ('_2015_1') nicht faelschlich als TileKey gilt.
-_OLD_TILEKEY    = re.compile(r"[_-](\d{3,4})[_-]\d{1,4}$")
-
-# Hoehen sind immer LN02: getaggt wird ausschliesslich mit den byte-exakten GDWH-
-# Referenz-VLRs (_inject_reference_vlrs), LHN95-Quellen werden abgelehnt.
+# Der Hoehenbezug kommt aus der GUI-Auswahl (LN02 | LHN95) und wird nur getaggt - ein CRS-Tag
+# bzw. CRS-Hinweis im Dateinamen der Quelle wird ignoriert (Widerspruch -> nur Warnung).
+# Koordinaten und Hoehen werden nie umgerechnet.
 PLAUSIBLE_Z = (150.0, 4900.0)   # Schweiz: tiefster Punkt 193 m, hoechster 4634 m (+ Reserve)
+HEIGHT_REFS = {"LN02": 5728, "LHN95": 5729}
+
+# ─── Benennung der Kacheln (beide Input-Formate) ───────────────────────────────
+# <Jahr>_<AREA>_TIN_DSM[_thin<NN>]_<NAME>_LV95_<LN02|LHN95>.<laz|las>
+#   z.B. 2021_DIABLONS_TIN_DSM_thin02_2612_1107_LV95_LN02.laz
+# <NN> = Thinning-Abstand in Dezimetern, zweistellig (0.2 m -> 02, 1.5 m -> 15).
+# Die Endung _LV95_<Hoehe> entspricht dem Muster des GDWH-Imports (4_SB_DSM_PUNKTWOLKE_LAS14upgrade.py).
+# Alle Dateien eines Input-Ordners ergeben EINEN Kachelsatz (je Zelle zusammengefuehrt).
+LAS_TILE_TOKEN = "TIN_DSM"
+THIN_OPTIONS_M = (0.1, 0.2, 0.4, 0.8, 1.0, 1.5, 2.0)
+OUT_FORMATS    = ("laz", "las")
 
 # Grosse ASCII-Dateien (gemergte Gebiete) werden fuer paralleles Einlesen an Zeilen-
 # grenzen in Teile zerlegt - readers.text liest einspurig (gemessen ~0.5 Mio Punkte/s).
@@ -68,9 +68,15 @@ ASCII_CHUNK_MB = 256
 # Plausible Koordinatenbereiche (m) mit Rand, zur Erkennung LV95 vs. LV03
 LV95_RANGE = ((2400000.0, 2900000.0), (1000000.0, 1400000.0))
 LV03_RANGE = ((400000.0, 900000.0), (0.0, 400000.0))
+# Geographische Koordinaten (Grad, Laenge/Breite) im Raum Schweiz mit Rand
+DEGREE_RANGE = ((5.0, 11.5), (45.0, 48.5))
 NOT_LV95_HINT = ("LV03-Daten zuerst mit GeoSuite/REFRAME (FINELTRA) nach LV95 transformieren - "
                  "dieses Tool transformiert bewusst nicht (PROJ haette ohne CHENyx06-Gitter nur "
                  "eine Ballpark-Transformation).")
+DEGREE_HINT = ("Koordinaten in Grad (geographisch) - ein reiner CRS-Tag EPSG:2056 waere falsch. "
+               "Zuerst nach LV95 projizieren: aus CH1903+ (EPSG:4150) ist das eine exakte Abbildung "
+               "ohne Datumswechsel, aus WGS84/ETRS89 (EPSG:4326/4258) eine Datumstransformation "
+               "(GeoSuite/REFRAME). Aus den Werten allein ist das nicht zu unterscheiden.")
 
 # ─── Byte-exakte CRS-VLRs LV95/LN02 ────────────────────────────────────────────
 # Unveraendert uebernommen aus topo-DMCdataConverter (dort aus der verifizierten
@@ -98,6 +104,43 @@ REFERENCE_VLR_2112_B64 = (
     "T1JJVFlbIkVQU0ciLCI1NzI4Il1dXQA="
 )
 
+# LV95/LHN95: es gibt (noch) keine verifizierte Referenzkachel. Abgeleitet aus der
+# LN02-Referenz, geaendert wird NUR der Hoehenteil: der VERT_CS-Block im WKT (zeichengleich
+# mit der GDAL/PROJ-Definition von EPSG:5728 bzw. 5729) und der VerticalCSTypeGeoKey
+# (4096) im GeoTIFF-KeyDirectory. Alles andere bleibt byte-identisch zur Referenz.
+_VERT_CS_LN02 = (b'VERT_CS["LN02 height",VERT_DATUM["Landesnivellement 1902",2005,AUTHORITY["EPSG","5127"]],'
+                 b'UNIT["metre",1,AUTHORITY["EPSG","9001"]],AXIS["Gravity-related height",UP],'
+                 b'AUTHORITY["EPSG","5728"]]')
+_VERT_CS_LHN95 = (b'VERT_CS["LHN95 height",VERT_DATUM["Landeshohennetz 1995",2005,AUTHORITY["EPSG","5128"]],'
+                  b'UNIT["metre",1,AUTHORITY["EPSG","9001"]],AXIS["Gravity-related height",UP],'
+                  b'AUTHORITY["EPSG","5729"]]')
+
+
+def _geokeys_with_vertical(payload: bytes, vertical_epsg: int) -> bytes:
+    """GeoTIFF-KeyDirectory (VLR 34735) mit ersetztem VerticalCSTypeGeoKey (4096)."""
+    b = bytearray(payload)
+    n_keys, = struct.unpack_from("<H", b, 6)
+    for k in range(n_keys):
+        key_id, location, _, _ = struct.unpack_from("<4H", b, 8 + 8 * k)
+        if key_id == 4096 and location == 0:
+            struct.pack_into("<H", b, 8 + 8 * k + 6, vertical_epsg)
+            return bytes(b)
+    raise ValueError("Referenz-KeyDirectory ohne VerticalCSTypeGeoKey (4096)")
+
+
+def _reference_vlr_payloads() -> dict:
+    """{Hoehenbezug: (payload 34735, payload 2112)} - byte-exakt fuer LN02, abgeleitet fuer LHN95."""
+    keys_ln02 = base64.b64decode(REFERENCE_VLR_34735_B64)
+    wkt_ln02 = base64.b64decode(REFERENCE_VLR_2112_B64)
+    if wkt_ln02.count(_VERT_CS_LN02) != 1:
+        raise ValueError("LN02-Referenz-WKT enthaelt den erwarteten VERT_CS-Block nicht genau einmal")
+    return {"LN02": (keys_ln02, wkt_ln02),
+            "LHN95": (_geokeys_with_vertical(keys_ln02, HEIGHT_REFS["LHN95"]),
+                      wkt_ln02.replace(_VERT_CS_LN02, _VERT_CS_LHN95))}
+
+
+REFERENCE_VLRS = _reference_vlr_payloads()
+
 # Staging-Namen bewusst kurz: pdal.exe ist nicht long-path-aware (Windows MAX_PATH).
 # Getestet (PDAL 2.10): Pipeline-Datei mit 262 Zeichen -> "PDAL: file not found".
 PIECE_NAME_PATTERN = re.compile(r"^t(-?\d+)_(-?\d+)\.laz$", re.IGNORECASE)
@@ -106,13 +149,14 @@ STAGING_NAME_RESERVE = 24    # laengster Staging-Name unter run_dir: "\p\00000\t
 NAME_FIELD_RESERVE   = 15    # Feldbreite 'NAME' in swissGRID
 
 
-def _check_path_lengths(files: list, run_dir: Path, output_dir: str, max_base_len: int) -> None:
+def _check_path_lengths(files: list, run_dir: Path, output_dir: str, max_base_len: int,
+                        suffix: str = "_LV95_LHN95") -> None:
     """Bricht vor der Verarbeitung ab, wenn pdal.exe einen Pfad nicht oeffnen koennte
     (sonst scheitert der Lauf erst mittendrin mit einem irrefuehrenden 'file not found')."""
     checks = [("Input-Datei", max(len(f) for f in files)),
               ("Staging-Datei", len(str(run_dir)) + STAGING_NAME_RESERVE),
               ("Output-Kachel", len(output_dir) + 1 + max_base_len + 1 + NAME_FIELD_RESERVE
-               + len(OUT_NAME_SUFFIX) + 4)]
+               + len(suffix) + 4)]
     too_long = [f"{label}: bis {n} Zeichen" for label, n in checks if n > PDAL_MAX_PATH]
     if too_long:
         raise ValueError("Pfad zu lang fuer pdal.exe (Windows MAX_PATH = 260 Zeichen, pdal.exe ist nicht "
@@ -161,9 +205,10 @@ def _read_las_header(path: str) -> dict:
     }
 
 
-def _read_vlr_ids(path: str, header: dict) -> list:
-    """(user_id, record_id) aller VLRs - fuer die CRS-Tag-Kontrolle der Ausgabe."""
-    ids = []
+def _read_vlrs(path: str, header: dict = None) -> list:
+    """(user_id, record_id, payload) aller VLRs - nur der unkomprimierte Kopfbereich."""
+    header = header or _read_las_header(path)
+    vlrs = []
     with open(path, "rb") as f:
         f.seek(header["header_size"])
         for _ in range(header["n_vlr"]):
@@ -171,13 +216,18 @@ def _read_vlr_ids(path: str, header: dict) -> list:
             if len(rec) < 54:
                 break
             _, uid, rid, rlen, _ = struct.unpack("<H16sHH32s", rec)
-            ids.append((uid.split(b"\x00")[0].decode("ascii", "replace"), rid))
-            f.seek(rlen, 1)
-    return ids
+            vlrs.append((uid.split(b"\x00")[0].decode("ascii", "replace"), rid, f.read(rlen)))
+    return vlrs
+
+
+def _read_vlr_ids(path: str, header: dict) -> list:
+    """(user_id, record_id) aller VLRs - fuer die CRS-Tag-Kontrolle der Ausgabe."""
+    return [(uid, rid) for uid, rid, _ in _read_vlrs(path, header)]
 
 
 def _classify_crs(minx: float, miny: float, maxx: float, maxy: float) -> str:
-    """'LV95' | 'LV03' | 'unbekannt' anhand des Koordinatenbereichs (Plausibilitaet)."""
+    """'LV95' | 'LV03' | 'GRAD' | 'unbekannt' anhand des Koordinatenbereichs (Plausibilitaet).
+    Der CRS-Tag einer Datei spielt dafuer keine Rolle - massgebend sind die Werte."""
     def _inside(rng):
         (x0, x1), (y0, y1) = rng
         return x0 <= minx <= maxx <= x1 and y0 <= miny <= maxy <= y1
@@ -185,6 +235,8 @@ def _classify_crs(minx: float, miny: float, maxx: float, maxy: float) -> str:
         return "LV95"
     if _inside(LV03_RANGE):
         return "LV03"
+    if _inside(DEGREE_RANGE):
+        return "GRAD"
     return "unbekannt"
 
 
@@ -244,6 +296,57 @@ def _pdal_srs_name(pdal_exe: str, path: str) -> str:
     return label
 
 
+def _crs_label(wkt: str, node: str) -> str:
+    """'Name (EPSG:code)' des Teil-CRS 'node' (PROJCS | GEOGCS | VERT_CS) eines WKT, sonst ''."""
+    if not wkt:
+        return ""
+    from osgeo import osr
+    osr.UseExceptions()
+    try:
+        s = osr.SpatialReference()
+        s.ImportFromWkt(wkt)
+    except Exception:
+        return ""
+    name = s.GetAttrValue(node)
+    if not name:
+        return ""
+    code = s.GetAuthorityCode(node)
+    return f"{name} (EPSG:{code})" if code else f"{name} (ohne EPSG-Code)"
+
+
+def _file_metadata(pdal_exe: str, path: str) -> dict:
+    """Header-Metadaten EINER LAS/LAZ-Datei fuer die Datei-Info im GUI ('pdal info --metadata'
+    und '--schema' lesen nur den Kopf - auch bei einem grossen gemergten LAZ sofort da)."""
+    md = json.loads(_run_pdal(pdal_exe, ["info", "--metadata", path]))["metadata"]
+    srs = md.get("srs") or {}
+    wkt = srs.get("compoundwkt") or srs.get("wkt") or ""
+    horizontal = _crs_label(wkt, "PROJCS") or _crs_label(wkt, "GEOGCS")
+    if horizontal and srs.get("isgeographic"):
+        horizontal += "  - geographisch (Grad)"
+    try:
+        schema = json.loads(_run_pdal(pdal_exe, ["info", "--schema", path])).get("schema") or {}
+        dims = [d.get("name") for d in schema.get("dimensions") or []]
+    except Exception:
+        dims = []
+    vlrs = [f"{uid}/{rid}" for uid, rid, _ in _read_vlrs(path)]
+    return {
+        "file": os.path.basename(path),
+        "version": f"LAS {md.get('major_version', 1)}.{md.get('minor_version')}  /  "
+                   f"PF{md.get('dataformat_id')}  /  {'LAZ' if md.get('compressed') else 'LAS'}",
+        "count": md.get("count", 0),
+        "scale": [md.get("scale_x"), md.get("scale_y"), md.get("scale_z")],
+        "offset": [md.get("offset_x"), md.get("offset_y"), md.get("offset_z")],
+        "global_encoding": md.get("global_encoding"),
+        "software": " / ".join(v for v in (str(md.get("software_id") or "").strip(),
+                                           str(md.get("system_id") or "").strip()) if v),
+        "created": f"{md.get('creation_year')}, Tag {md.get('creation_doy')}" if md.get("creation_year") else "",
+        "crs_horizontal": horizontal or "– (kein Lage-CRS im Tag)",
+        "crs_vertical": _crs_label(wkt, "VERT_CS") or "– (kein Hoehen-CRS im Tag)",
+        "vlrs": vlrs,
+        "dims": dims,
+    }
+
+
 def _discard(path) -> None:
     try:
         if path and os.path.isfile(str(path)):
@@ -267,12 +370,13 @@ def _build_vlr_record(user_id: str, record_id: int, description: str, payload: b
     return header + payload
 
 
-def _inject_reference_vlrs(las_path: str) -> int:
-    """Ersetzt alle CRS-VLRs durch die zwei byte-exakten LV95/LN02-Referenz-VLRs
+def _inject_reference_vlrs(las_path: str, height_ref: str = "LN02") -> int:
+    """Ersetzt alle CRS-VLRs durch die zwei Referenz-VLRs LV95/<height_ref>
     (GeoTIFF-KeyDirectory 34735 + OGC-WKT 2112). In-place, nur auf Temp-Dateien
     aufrufen. Bei LAZ wird zusaetzlich die LASzip-Chunk-Table-Position korrigiert
     (int64 am Anfang des Punktbereichs), sonst bricht jede Dekompression ab.
     Gibt die Anzahl entfernter CRS-VLRs zurueck."""
+    keys_payload, wkt_payload = REFERENCE_VLRS[height_ref]
     with open(las_path, "rb") as f:
         head = f.read(512)
         header_size, offset_to_point_data, n_vlr = struct.unpack_from("<HII", head, 94)
@@ -293,10 +397,8 @@ def _inject_reference_vlrs(las_path: str) -> int:
             is_laszip = True
         pos += vlr_len
 
-    vlr1 = _build_vlr_record("LASF_Projection", 34735, REFERENCE_VLR_DESCRIPTION,
-                             base64.b64decode(REFERENCE_VLR_34735_B64))
-    vlr2 = _build_vlr_record("LASF_Projection", 2112, REFERENCE_VLR_DESCRIPTION,
-                             base64.b64decode(REFERENCE_VLR_2112_B64))
+    vlr1 = _build_vlr_record("LASF_Projection", 34735, REFERENCE_VLR_DESCRIPTION, keys_payload)
+    vlr2 = _build_vlr_record("LASF_Projection", 2112, REFERENCE_VLR_DESCRIPTION, wkt_payload)
     new_vlr_block = b"".join(kept) + vlr1 + vlr2
     new_offset = header_size + len(new_vlr_block)
     shift = new_offset - offset_to_point_data
@@ -396,15 +498,23 @@ def _sniff_ascii(path: str, max_lines: int = 50) -> dict:
             mapped = [_KNOWN_DIMS.get(t.strip().strip('"').lower()) for t in tokens]
             columns = [m or columns[i] for i, m in enumerate(mapped)]
 
-    xs, ys = [], []
+    xs, ys, zs = [], [], []
     for line in data:
         parts = _split_fields(line, sep)
-        if len(parts) >= 2 and _is_number(parts[0]) and _is_number(parts[1]):
+        if len(parts) >= 3 and all(_is_number(t) for t in parts[:3]):
             xs.append(float(parts[0]))
             ys.append(float(parts[1]))
+            zs.append(float(parts[2]))
+    # Mittlere Bytes je Datenzeile (+ Zeilenende, CRLF = 2 Byte) -> Schaetzung der Punktzahl
+    with open(path, "rb") as fb:
+        nl = 2 if b"\r\n" in fb.read(65536) else 1
+    line_bytes = sum(len(line.encode("utf-8")) + nl for line in data) / len(data)
+    head_bytes = sum(len(line.encode("utf-8")) + nl for line in lines[:skip])
     return {
         "separator": sep, "skip": skip, "ncols": ncols, "columns": " ".join(columns),
         "preview": lines[:4], "first_xy": [xs[0], ys[0]],
+        "zrange_sample": [min(zs), max(zs)],
+        "count_estimate": int(max(0, os.path.getsize(path) - head_bytes) / line_bytes),
         "crs_guess": _classify_crs(min(xs), min(ys), max(xs), max(ys)),
     }
 
@@ -415,25 +525,48 @@ def _list_inputs(input_dir: str, fmt: str) -> list:
                   if p.is_file() and p.suffix.lower() in exts)
 
 
-def _output_base(filename: str) -> str:
-    """Basis des Ausgabenamens <Basis>_<NAME>_LV95_LN02.laz aus einem Input-Dateinamen."""
-    stem = os.path.splitext(os.path.basename(filename))[0]
-    m = _LV95_MARKER.search(stem)
-    base = stem[:m.start()] if m else stem
-    k = _OLD_TILEKEY.search(base)
-    if k and (480 <= int(k.group(1)) <= 840 or 1011 <= int(k.group(1)) <= 1374
-              or 2480 <= int(k.group(1)) <= 2840):
-        base = base[:k.start()]
-    return base.rstrip("_- ") or stem
+# CRS-Hinweise im Dateinamen (ASCII hat keinen CRS-Tag - der Name ist oft die einzige Angabe)
+_NAME_CRS_TOKENS = (("LV95", "LV95"), ("LV03", "LV03"), ("LN02", "LN02"), ("LHN95", "LHN95"),
+                    ("2056", "EPSG:2056"), ("21781", "EPSG:21781"), ("WGS84", "WGS84"),
+                    ("ETRS89", "ETRS89"), ("CH1903", "CH1903"))
 
 
-def _group_by_base(files: list, base_override: str = "") -> dict:
-    """{basis: [dateien]} - Dateien mit gleicher Basis ergeben EINEN Kachelsatz.
-    Ein gesetzter base_override gilt fuer alle Dateien."""
-    groups = {}
-    for f in files:
-        groups.setdefault(base_override or _output_base(f), []).append(f)
-    return groups
+def _name_crs_hints(filename: str) -> list:
+    """CRS-Stichworte im Dateinamen, z.B. ['LV95', 'LN02'] (als eigenes Wort, _ - . als Trenner)."""
+    stem = os.path.splitext(os.path.basename(filename))[0].upper()
+    words = set(re.split(r"[_\-.\s+]+", stem))
+    return [label for token, label in _NAME_CRS_TOKENS if token in words]
+
+
+def _source_height(path: str, fmt: str) -> str:
+    """Hoehenbezug laut Quelle: LAS/LAZ aus dem CRS-Tag, ASCII aus dem Dateinamen. '' = keine Angabe."""
+    if fmt == "las":
+        return _vertical_tag(path)
+    hints = _name_crs_hints(path)
+    return next((h for h in ("LHN95", "LN02") if h in hints), "")
+
+
+def _ascii_metadata(path: str, sniff: dict) -> dict:
+    """Metadaten der ersten ASCII-Datei fuer die Datei-Info (Gegenstueck zu _file_metadata)."""
+    crs_text = {"LV95": "Werte passen zu LV95 (EPSG:2056)",
+                "LV03": "Werte passen zu LV03 (EPSG:21781) - NICHT unterstuetzt",
+                "GRAD": "Werte in Grad (geographisch) - NICHT unterstuetzt",
+                }.get(sniff["crs_guess"], "Werte weder LV95 noch LV03 - Spalten pruefen")
+    hints = _name_crs_hints(path)
+    height = next((h for h in ("LHN95", "LN02") if h in hints), "")
+    x, y = sniff["first_xy"]
+    return {
+        "file": os.path.basename(path),
+        "size": f"{os.path.getsize(path) / 1024 ** 2:,.1f} MB",
+        "version": f"ASCII  /  {sniff['ncols']} Spalten ({sniff['columns']})  /  {sniff['skip']} Kopfzeile(n)",
+        "count": f"~ {_fmt_count(sniff['count_estimate'])}  (geschaetzt aus Dateigroesse)",
+        "crs_horizontal": f"kein CRS-Tag (ASCII)  |  {crs_text}",
+        "crs_vertical": f"kein CRS-Tag (ASCII)  |  Dateiname: {height}" if height
+                        else "kein CRS-Tag (ASCII)  |  Dateiname ohne Hoehenangabe",
+        "name_hints": ", ".join(hints) or "– (keine CRS-Angabe im Dateinamen)",
+        "first_line": f"X {x:.2f}  /  Y {y:.2f}",
+        "zrange": "{:.2f} – {:.2f} m (erste Zeilen)".format(*sniff["zrange_sample"]),
+    }
 
 
 def _overlapping_pairs(boxes: dict, min_share: float = 0.01) -> list:
@@ -451,29 +584,58 @@ def _overlapping_pairs(boxes: dict, min_share: float = 0.01) -> list:
     return pairs
 
 
+def _vertical_tag(path: str) -> str:
+    """Hoehenbezug laut CRS-VLRs einer LAS/LAZ-Datei: 'LN02' | 'LHN95' | '' (kein/anderer Tag).
+    Geprueft werden WKT (2111/2112) und VerticalCSTypeGeoKey (4096) im KeyDirectory (34735)."""
+    for _, record_id, payload in _read_vlrs(path):
+        if record_id in (2111, 2112):
+            for ref, epsg in HEIGHT_REFS.items():
+                if ref.encode() in payload or f'"{epsg}"'.encode() in payload:
+                    return ref
+        if record_id == 34735 and len(payload) >= 8:
+            n_keys, = struct.unpack_from("<H", payload, 6)
+            for k in range(n_keys):
+                if 16 + 8 * k > len(payload):
+                    break
+                key_id, location, _, value = struct.unpack_from("<4H", payload, 8 + 8 * k)
+                if key_id == 4096 and location == 0:
+                    for ref, epsg in HEIGHT_REFS.items():
+                        if value == epsg:
+                            return ref
+    return ""
+
+
 def _lhn95_tagged(path: str) -> bool:
-    """True, wenn die CRS-VLRs einer LAS/LAZ-Datei LHN95 (EPSG:5729) deklarieren -
-    WKT (2111/2112) oder VerticalCSTypeGeoKey (4096) im GeoTIFF-KeyDirectory (34735)."""
-    h = _read_las_header(path)
-    with open(path, "rb") as f:
-        f.seek(h["header_size"])
-        for _ in range(h["n_vlr"]):
-            rec = f.read(54)
-            if len(rec) < 54:
-                break
-            _, _, record_id, record_len, _ = struct.unpack("<H16sHH32s", rec)
-            payload = f.read(record_len)
-            if record_id in (2111, 2112) and (b"LHN95" in payload or b'"5729"' in payload):
-                return True
-            if record_id == 34735 and len(payload) >= 8:
-                n_keys, = struct.unpack_from("<H", payload, 6)
-                for k in range(n_keys):
-                    if 16 + 8 * k > len(payload):
-                        break
-                    key_id, location, _, value = struct.unpack_from("<4H", payload, 8 + 8 * k)
-                    if key_id == 4096 and location == 0 and value == 5729:
-                        return True
-    return False
+    """True, wenn die CRS-VLRs einer LAS/LAZ-Datei LHN95 (EPSG:5729) deklarieren."""
+    return _vertical_tag(path) == "LHN95"
+
+
+def _thin_token(thin_m) -> str:
+    """'thin02' fuer 0.2 m, '' ohne Thinning."""
+    if not thin_m:
+        return ""
+    return f"thin{int(round(float(thin_m) * 10)):02d}"
+
+
+def _las_tile_base(jahr: str, area: str, thin_m) -> str:
+    """Basis der LAZ-Tab-Benennung: <Jahr>_<AREA>_TIN_DSM[_thin<NN>]."""
+    parts = [str(jahr).strip(), str(area).strip(), LAS_TILE_TOKEN, _thin_token(thin_m)]
+    return "_".join(p for p in parts if p)
+
+
+def _height_suffix(height_ref: str) -> str:
+    return f"_LV95_{height_ref}"
+
+
+def _target_point_format(source_formats) -> int:
+    """Ziel-PF (LAS 1.4) nach den Feldern der Quelle: PF6, PF7 falls RGB, PF8 falls RGB+NIR.
+    PF0/1 -> 6, PF2/3 -> 7, PF6/7/8 bleiben. Waveform (PF4/5/9/10) schreibt PDAL nicht."""
+    formats = set(source_formats)
+    if formats & {8, 10}:
+        return 8
+    if formats & set(PC_FORMATS_WITH_RGB):
+        return OUT_POINT_FORMAT_RGB
+    return OUT_POINT_FORMAT
 
 
 def _split_ascii(src: str, chunk_dir: Path, n_parts: int) -> list:
@@ -537,7 +699,18 @@ def _info(cfg: dict) -> None:
         return
 
     if fmt == "ascii":
-        result.update(_sniff_ascii(files[0]))
+        sniff = _sniff_ascii(files[0])
+        result.update(sniff)
+        heights = {}
+        for p in files:
+            h = _source_height(p, "ascii") or "ohne"
+            heights[h] = heights.get(h, 0) + 1
+        result.update({
+            "vertical_tags": heights,   # ASCII: aus dem Dateinamen
+            "target_pf": OUT_POINT_FORMAT_RGB if {"Red", "Green", "Blue"} & set(sniff["columns"].split())
+                         else OUT_POINT_FORMAT,
+            "first_meta": _ascii_metadata(files[0], sniff),
+        })
     else:
         headers = [_read_las_header(p) for p in files]
         minx = min(h["minx"] for h in headers)
@@ -553,17 +726,29 @@ def _info(cfg: dict) -> None:
             pdal_exe = _resolve_pdal_exe(cfg)
         except FileNotFoundError:
             pass
+        vertical_tags = {}
+        for p in files:
+            tag = _vertical_tag(p) or "ohne"
+            vertical_tags[tag] = vertical_tags.get(tag, 0) + 1
+        formats = sorted({h["point_format"] for h in headers})
         result.update({
-            "version": f"LAS 1.{h0['minor_version']}  /  PF{h0['point_format']}"
+            "version": f"LAS 1.{h0['minor_version']}  /  PF{'/'.join(str(f) for f in formats)}"
                        + ("  (LAZ)" if h0["compressed"] else "  (LAS)"),
             "count_total": sum(h["count"] for h in headers),
             "extent": [minx, miny, maxx, maxy],
             "zrange": [min(h["minz"] for h in headers), max(h["maxz"] for h in headers)],
             "has_rgb": any(h["point_format"] in PC_FORMATS_WITH_RGB for h in headers),
+            "target_pf": _target_point_format(formats),
             "crs_guess": _classify_crs(minx, miny, maxx, maxy),
             "crs_tag": _pdal_srs_name(pdal_exe, files[0]) if pdal_exe else "(pdal.exe nicht gefunden)",
+            "vertical_tags": vertical_tags,
             "n_cells_max": len(cells),
         })
+        if pdal_exe:
+            try:
+                result["first_meta"] = _file_metadata(pdal_exe, files[0])
+            except Exception as e:
+                result["first_meta"] = {"file": os.path.basename(files[0]), "error": str(e)}
     print(json.dumps(result, ensure_ascii=False), flush=True)
 
 
@@ -634,10 +819,10 @@ def _load_grid_cells(grid_shape_path: str, bbox: tuple) -> tuple:
 
 # ─── Worker (laufen parallel in Threads, die Arbeit macht pdal.exe) ────────────
 def _las_writer(filename: str, point_format: int, offset=(0.0, 0.0, 0.0), srs="EPSG:2056",
-                global_encoding=None) -> dict:
+                global_encoding=None, compress: bool = True) -> dict:
     writer = {"type": "writers.las", "filename": filename,
               # Kompression explizit, nicht ueber die Dateiendung erraten lassen
-              "compression": "laszip",
+              "compression": "laszip" if compress else "false",
               "minor_version": OUT_MINOR_VERSION, "dataformat_id": point_format,
               "scale_x": OUT_SCALE, "scale_y": OUT_SCALE, "scale_z": OUT_SCALE,
               "offset_x": offset[0], "offset_y": offset[1], "offset_z": offset[2],
@@ -697,8 +882,10 @@ def _split_worker(args) -> tuple:
 
 
 def _validate_tile(path: str, h: dict, origin: tuple, size: float, point_format: int,
-                   expected_count: int) -> list:
-    """Kontrolle statt Annahme: Header-Zielwerte, Punktbilanz, Kachelrahmen, CRS-VLRs."""
+                   expected_count: int, height_ref: str = "LN02", thinned: bool = False,
+                   compressed: bool = True) -> list:
+    """Kontrolle statt Annahme: Header-Zielwerte, Punktbilanz, Kachelrahmen, CRS-VLRs.
+    Mit Thinning muss die Punktzahl nur 1 .. expected_count sein (ausgeduennt)."""
     problems = []
     if h["minor_version"] != OUT_MINOR_VERSION or h["point_format"] != point_format:
         problems.append(f"LAS 1.{h['minor_version']}/PF{h['point_format']}, erwartet "
@@ -711,16 +898,24 @@ def _validate_tile(path: str, h: dict, origin: tuple, size: float, point_format:
         problems.append(f"scale={h['scale']}, erwartet {OUT_SCALE}")
     if abs(h["offset"][0] - origin[0]) > 1e-6 or abs(h["offset"][1] - origin[1]) > 1e-6:
         problems.append(f"offset={h['offset'][:2]}, erwartet Kachelursprung {origin}")
-    if h["count"] != expected_count:
+    if h["compressed"] != compressed:
+        problems.append("LAZ-komprimiert" if h["compressed"] else "nicht LAZ-komprimiert")
+    if thinned:
+        if not 0 < h["count"] <= expected_count:
+            problems.append(f"Punktzahl {h['count']} nach Thinning, erwartet 1..{expected_count}")
+    elif h["count"] != expected_count:
         problems.append(f"Punktzahl {h['count']} statt {expected_count} (Summe der Kachelstuecke)")
     eps = FRAME_TOLERANCE_M
     if (h["minx"] < origin[0] - eps or h["maxx"] > origin[0] + size + eps or
             h["miny"] < origin[1] - eps or h["maxy"] > origin[1] + size + eps):
         problems.append(f"Punkte ausserhalb des Kachelrahmens (BBox X {h['minx']:.2f}-{h['maxx']:.2f}, "
                         f"Y {h['miny']:.2f}-{h['maxy']:.2f})")
-    crs_vlrs = sorted(v for v in _read_vlr_ids(path, h) if _is_crs_vlr(*v))
-    if crs_vlrs != [("LASF_Projection", 2112), ("LASF_Projection", 34735)]:
-        problems.append(f"CRS-VLRs {crs_vlrs}, erwartet genau die LV95/LN02-Referenz (2112 + 34735)")
+    keys_payload, wkt_payload = REFERENCE_VLRS[height_ref]
+    crs_vlrs = sorted((uid, rid, payload) for uid, rid, payload in _read_vlrs(path, h)
+                      if _is_crs_vlr(uid, rid))
+    if crs_vlrs != [("LASF_Projection", 2112, wkt_payload), ("LASF_Projection", 34735, keys_payload)]:
+        problems.append(f"CRS-VLRs {[v[:2] for v in crs_vlrs]}, erwartet genau die "
+                        f"LV95/{height_ref}-Referenz (2112 + 34735, byte-exakt)")
     return problems
 
 
@@ -728,27 +923,34 @@ def _tile_worker(args) -> tuple:
     """Fuegt die Kachelstuecke EINER Grid-Zelle eines Kachelsatzes zusammen und schreibt
     die Endkachel im Zielformat. Atomar: Temp-Datei im Output-Ordner, erst nach
     bestandener Validierung per os.replace an ihren Platz.
+    Mit thin_m wird die zusammengefuehrte Zelle vor dem Schreiben ausgeduennt
+    (filters.sample, Mindestabstand thin_m - wie im Projekt topo-DMCdataConverter).
     Rueckgabe: (status, dateiname, punktzahl, fehler, ueberschrieben)."""
-    key, out_path, pieces, expected_count, pipeline_path, pdal_exe, size, point_format = args
+    (key, out_path, pieces, expected_count, pipeline_path, pdal_exe, size, point_format,
+     height_ref, thin_m) = args
     origin = (key[0] * size, key[1] * size)
     out_name = os.path.basename(out_path)
-    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".laz", dir=os.path.dirname(out_path))
+    ext = os.path.splitext(out_path)[1].lower()
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=ext, dir=os.path.dirname(out_path))
     os.close(fd)
     os.remove(tmp_path)  # writers.las legt die Datei selbst an
 
     stages = [{"type": "readers.las", "filename": p, "tag": f"r{i}"} for i, p in enumerate(pieces)]
     if len(stages) > 1:
         stages.append({"type": "filters.merge", "inputs": [s["tag"] for s in stages]})
-    # PDAL schreibt vorerst nur LV95 - die autoritativen LV95/LN02-VLRs kommen danach per Byte-Patch
+    if thin_m:
+        stages.append({"type": "filters.sample", "radius": float(thin_m)})
+    # PDAL schreibt vorerst nur LV95 - die autoritativen LV95/<Hoehe>-VLRs kommen danach per Byte-Patch
     stages.append(_las_writer(tmp_path, point_format, (origin[0], origin[1], 0.0), "EPSG:2056",
-                              OUT_GLOBAL_ENCODING))
+                              OUT_GLOBAL_ENCODING, compress=(ext == ".laz")))
     try:
         _run_pipeline(pdal_exe, stages, Path(pipeline_path))
         if not os.path.isfile(tmp_path) or _read_las_header(tmp_path)["count"] == 0:
             return ("empty", out_name, 0, None, False)
-        _inject_reference_vlrs(tmp_path)
+        _inject_reference_vlrs(tmp_path, height_ref)
         h = _read_las_header(tmp_path)
-        problems = _validate_tile(tmp_path, h, origin, size, point_format, expected_count)
+        problems = _validate_tile(tmp_path, h, origin, size, point_format, expected_count,
+                                  height_ref, bool(thin_m), compressed=(ext == ".laz"))
         if problems:
             return ("error", out_name, 0, "; ".join(problems), False)
         existed = os.path.isfile(out_path)
@@ -762,32 +964,394 @@ def _tile_worker(args) -> tuple:
         _discard(pipeline_path)
 
 
+# ─── DSM-Raster + Hillshade (optional, aus den fertigen Kacheln) ───────────────
+# Uebernommen aus topo-DMCdataConverter (_raster_cell_worker, _fill_raster_nodata,
+# _prepare_hillshade_values, _mosaic_las_raster) - Aenderungen dort hier nachziehen.
+# Abweichungen: kein AOI-Shape (NoData nur, wo keine Punkte liegen), das DSM traegt das
+# zusammengesetzte CRS LV95 + Hoehe, der Hillshade ist dort NoData, wo das DSM NoData ist.
+# NoData des FERTIGEN Float32-DSM: exakt -FLT_MAX (GDWH-Konvention SB_DSM).
+RASTER_NODATA = -3.4028234663852886e+38
+# NoData der Zwischen-Zellraster aus writers.gdal: PDAL lehnt -FLT_MAX als nodata ab
+# ("Invalid nodata value ... for output data_type 'float'"), gdal.Warp setzt ihn danach um.
+CELL_NODATA = -9999.0
+# Hillshade (Byte): 255 = NoData. gdaldem liefert 1..255 - ein voll beleuchtetes Pixel wird
+# auf 254 gezogen, damit 255 eindeutig "keine Daten" bedeutet.
+HILLSHADE_NODATA    = 255
+HILLSHADE_VALID_MAX = 254
+# Kleine NoData-Loecher (Rauschen) werden interpoliert, grosse bleiben NoData.
+FILL_MAX_HOLE_AREA_M2   = 900.0
+FILL_HOLE_CONNECTEDNESS = 8
+RASTER_WORK_CELL_M      = 1000.0   # Arbeitszellen (RAM-Begrenzung), werden danach mosaikiert
+RASTER_OUT_CO = ["TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512", "COMPRESS=LZW", "BIGTIFF=YES", "TFW=YES"]
+
+
+def _raster_names(jahr: str, area: str, gsd: float, height_ref: str) -> tuple:
+    """(DSM, Hillshade): <Jahr>_<AREA>_DSM_<GSD>cm_LV95_<Hoehe>.tif - wie topo-DMCdataConverter."""
+    label = f"{int(round(float(gsd) * 100))}cm"
+    return (f"{jahr}_{area}_DSM_{label}{_height_suffix(height_ref)}.tif",
+            f"{jahr}_{area}_hillshade_{label}{_height_suffix(height_ref)}.tif")
+
+
+def _raster_cell_buffer(gsd: float) -> float:
+    """Puffer um eine Arbeitszelle: IDW-Nachbarschaft am Zellrand vollstaendig, keine Naht."""
+    return max(3.0 * float(gsd), 2.0)
+
+
+def _dsm_cell_jobs(tile_bboxes: list, snap_bounds: tuple, gsd: float) -> list:
+    """Zerlegt den Datenbereich in Arbeitszellen (auf snap_bounds beschnitten, auf das
+    GSD-Raster gelegt). Jede Zelle bekommt die Kacheln, die ihren GEPUFFERTEN Ausschnitt
+    beruehren. tile_bboxes: [(pfad, minx, miny, maxx, maxy), ...]."""
+    import math
+    buf = _raster_cell_buffer(gsd)
+    ox, oy = snap_bounds[0], snap_bounds[1]
+    size = RASTER_WORK_CELL_M
+    jobs = []
+    for e in range(int(math.floor(snap_bounds[0] / size)), int(math.ceil(snap_bounds[2] / size))):
+        for n in range(int(math.floor(snap_bounds[1] / size)), int(math.ceil(snap_bounds[3] / size))):
+            cminx, cmaxx = max(e * size, snap_bounds[0]), min((e + 1) * size, snap_bounds[2])
+            cminy, cmaxy = max(n * size, snap_bounds[1]), min((n + 1) * size, snap_bounds[3])
+            if cmaxx <= cminx or cmaxy <= cminy:
+                continue
+            # Epsilon gegen Float-Rauschen (sonst gelegentlich eine Pixelspalte Ueberlappung)
+            rb = (ox + math.floor((cminx - ox) / gsd + 1e-6) * gsd,
+                  oy + math.floor((cminy - oy) / gsd + 1e-6) * gsd,
+                  ox + math.ceil((cmaxx - ox) / gsd - 1e-6) * gsd,
+                  oy + math.ceil((cmaxy - oy) / gsd - 1e-6) * gsd)
+            tiles = [b[0] for b in tile_bboxes
+                     if not (b[3] <= rb[0] - buf or b[1] >= rb[2] + buf or
+                             b[4] <= rb[1] - buf or b[2] >= rb[3] + buf)]
+            if tiles:
+                jobs.append({"cell": f"{e}_{n}", "raster_bounds": rb, "tiles": tiles})
+    return jobs
+
+
+def _raster_cell_worker(args) -> tuple:
+    """Rastert EINE Arbeitszelle (PDAL writers.gdal, IDW) auf den gesnappten Ausschnitt.
+    Rueckgabe: (status, zelle, fehler)."""
+    job, cells_dir, pipeline_path, pdal_exe, gsd, srs = args
+    r_minx, r_miny, r_maxx, r_maxy = job["raster_bounds"]
+    tif_out = str(Path(cells_dir) / f"dsm_{job['cell']}.tif")
+    buf = _raster_cell_buffer(gsd)
+    stages = [{"type": "readers.las", "filename": t, "tag": f"r{i}", "override_srs": srs}
+              for i, t in enumerate(job["tiles"])]
+    if len(stages) > 1:
+        stages.append({"type": "filters.merge", "inputs": [s["tag"] for s in stages]})
+    stages.append({"type": "filters.crop",
+                   "bounds": f"([{r_minx - buf:.3f},{r_maxx + buf:.3f}],[{r_miny - buf:.3f},{r_maxy + buf:.3f}])"})
+    stages.append({"type": "writers.gdal", "filename": tif_out, "resolution": float(gsd),
+                   "output_type": "idw", "gdaldriver": "GTiff", "data_type": "float32",
+                   "bounds": f"([{r_minx:.3f},{r_maxx:.3f}],[{r_miny:.3f},{r_maxy:.3f}])",
+                   "nodata": CELL_NODATA})
+    try:
+        _run_pipeline(pdal_exe, stages, Path(pipeline_path))
+        return ("written" if os.path.isfile(tif_out) else "empty", job["cell"], None)
+    except Exception as e:
+        _discard(tif_out)
+        return ("error", job["cell"], str(e))
+    finally:
+        _discard(pipeline_path)
+
+
+def _fill_raster_nodata(vrt_path: Path, work_dir: Path, gsd: float, num_threads: str,
+                        raw_hillshade_path: str) -> str:
+    """Interpoliert KLEINE NoData-Loecher (bis FILL_MAX_HOLE_AREA_M2), grosse bleiben NoData.
+    Nebenbei entsteht der rohe Hillshade aus dem Stand, in dem alle erreichbaren Loecher
+    gefuellt sind. Rueckgabe: Pfad des DSM mit gefuellten kleinen Loechern.
+    Ablauf: Mosaik materialisieren -> Loch-Maske sichern -> SieveFilter trennt grosse von
+    kleinen Loechern -> FillNodata fuellt alles -> Hillshade -> grosse Loecher zuruecksetzen."""
+    from osgeo import gdal
+    import numpy as np
+
+    filled_path = work_dir / "dsm_filled.tif"
+    mask_path   = work_dir / "holes_mask.tif"
+    sieve_path  = work_dir / "holes_large.tif"
+    max_hole_px = max(1, int(round(FILL_MAX_HOLE_AREA_M2 / (gsd * gsd))))
+    _log(f"  Kleine NoData-Loecher fuellen: bis {FILL_MAX_HOLE_AREA_M2:g} m2 = {max_hole_px} Pixel")
+
+    float_co = ["TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512", "COMPRESS=NONE", "BIGTIFF=YES",
+                f"NUM_THREADS={num_threads}"]
+    byte_co = ["TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512", "COMPRESS=LZW", "PREDICTOR=2",
+               "BIGTIFF=YES", f"NUM_THREADS={num_threads}"]
+    gdal.Translate(str(filled_path), str(vrt_path),
+                   options=gdal.TranslateOptions(format="GTiff", noData=CELL_NODATA,
+                                                 creationOptions=float_co)).FlushCache()
+
+    ds = mask_ds = sieve_ds = None
+    try:
+        ds = gdal.Open(str(filled_path), gdal.GA_Update)
+        band = ds.GetRasterBand(1)
+        xs, ys = band.XSize, band.YSize
+        rows_per_chunk = max(1, (64 * 1024 * 1024) // max(1, xs * 4))
+        _log(f"  Rastergroesse: {xs} x {ys} = {xs * ys / 1e6:.1f} Mio. Pixel")
+
+        def _byte_raster(path):
+            out = gdal.GetDriverByName("GTiff").Create(str(path), xs, ys, 1, gdal.GDT_Byte, options=byte_co)
+            out.SetGeoTransform(ds.GetGeoTransform())
+            out.SetProjection(ds.GetProjection())
+            return out
+
+        mask_ds = _byte_raster(mask_path)
+        mask_band = mask_ds.GetRasterBand(1)
+        holes_total = 0
+        for y0 in range(0, ys, rows_per_chunk):
+            rows = min(rows_per_chunk, ys - y0)
+            hole = (band.ReadAsArray(0, y0, xs, rows) == CELL_NODATA)
+            holes_total += int(np.count_nonzero(hole))
+            mask_band.WriteArray(hole.astype("uint8"), 0, y0)
+        mask_band.FlushCache()
+
+        # SieveFilter entfernt Polygone KLEINER als die Schwelle -> +1, damit ein Loch von
+        # exakt max_hole_px noch gefuellt wird
+        sieve_ds = _byte_raster(sieve_path)
+        sieve_band = sieve_ds.GetRasterBand(1)
+        gdal.SieveFilter(mask_band, None, sieve_band, max_hole_px + 1, FILL_HOLE_CONNECTEDNESS)
+        sieve_band.FlushCache()
+
+        old_tmpdir = gdal.GetConfigOption("CPL_TMPDIR")
+        gdal.SetConfigOption("CPL_TMPDIR", str(work_dir))
+        try:
+            gdal.FillNodata(band, None, float(max_hole_px), 0)
+        finally:
+            gdal.SetConfigOption("CPL_TMPDIR", old_tmpdir)
+        band.FlushCache()
+
+        # Hillshade aus DIESEM Stand (alles gefuellt) - vor dem Zuruecksetzen
+        ds.FlushCache()
+        gdal.DEMProcessing(str(raw_hillshade_path), ds, "hillshade",
+                           options=gdal.DEMProcessingOptions(computeEdges=True)).FlushCache()
+
+        # Grosse Loecher (nur was vorher schon NoData war) wieder auf NoData
+        kept = remaining = 0
+        for y0 in range(0, ys, rows_per_chunk):
+            rows = min(rows_per_chunk, ys - y0)
+            big = ((sieve_band.ReadAsArray(0, y0, xs, rows) != 0) &
+                   (mask_band.ReadAsArray(0, y0, xs, rows) != 0))
+            arr = band.ReadAsArray(0, y0, xs, rows)
+            n = int(np.count_nonzero(big))
+            if n:
+                arr[big] = CELL_NODATA
+                band.WriteArray(arr, 0, y0)
+                kept += n
+            remaining += int(np.count_nonzero(arr == CELL_NODATA))
+        band.FlushCache()
+    finally:
+        ds = mask_ds = sieve_ds = None
+
+    _log(f"  Interpoliert: {holes_total - kept} Pixel  |  NoData belassen (grosse Loecher, "
+         f"ausserhalb der Daten): {kept} Pixel")
+    if remaining != kept:
+        _log(f"  WARNUNG: {remaining - kept} Pixel blieben NoData, obwohl ihr Loch unter der "
+             "Schwelle liegt - kein gueltiger Nachbar in Reichweite.")
+    return str(filled_path)
+
+
+def _prepare_hillshade_values(path: str) -> int:
+    """Zieht im rohen Hillshade 255 (voll beleuchtet) und gdaldem-NoData auf 254 (in-place),
+    damit 255 im Endprodukt ausschliesslich NoData bedeutet. Gibt die Anzahl zurueck."""
+    from osgeo import gdal
+    import numpy as np
+    ds = gdal.Open(path, gdal.GA_Update)
+    try:
+        band = ds.GetRasterBand(1)
+        nd = band.GetNoDataValue()
+        nd = None if nd is None else int(nd)
+        rows_per_chunk = max(1, (64 * 1024 * 1024) // max(1, band.XSize))
+        changed = 0
+        for y0 in range(0, band.YSize, rows_per_chunk):
+            rows = min(rows_per_chunk, band.YSize - y0)
+            arr = band.ReadAsArray(0, y0, band.XSize, rows)
+            hit = arr == HILLSHADE_NODATA
+            if nd is not None and nd != HILLSHADE_NODATA:
+                hit |= arr == nd
+            n = int(np.count_nonzero(hit))
+            if n:
+                arr[hit] = HILLSHADE_VALID_MAX
+                band.WriteArray(arr, 0, y0)
+                changed += n
+        band.FlushCache()
+    finally:
+        ds = None
+    return changed
+
+
+def _mask_hillshade_by_dsm(hs_path: str, dsm_path: str) -> int:
+    """Setzt den Hillshade dort auf NoData (255), wo das DSM NoData traegt. Ohne AOI-Shape
+    ist das die einzige Aussage darueber, wo Daten liegen. Blockweise, gibt Anzahl zurueck."""
+    from osgeo import gdal
+    import numpy as np
+    hs_ds = gdal.Open(hs_path, gdal.GA_Update)
+    dsm_ds = gdal.Open(dsm_path, gdal.GA_ReadOnly)
+    try:
+        hs_band, dsm_band = hs_ds.GetRasterBand(1), dsm_ds.GetRasterBand(1)
+        nd = np.float32(RASTER_NODATA)
+        rows_per_chunk = max(1, (64 * 1024 * 1024) // max(1, dsm_band.XSize * 4))
+        masked = 0
+        for y0 in range(0, dsm_band.YSize, rows_per_chunk):
+            rows = min(rows_per_chunk, dsm_band.YSize - y0)
+            hole = dsm_band.ReadAsArray(0, y0, dsm_band.XSize, rows) == nd
+            n = int(np.count_nonzero(hole))
+            if n:
+                arr = hs_band.ReadAsArray(0, y0, hs_band.XSize, rows)
+                arr[hole] = HILLSHADE_NODATA
+                hs_band.WriteArray(arr, 0, y0)
+                masked += n
+        hs_band.FlushCache()
+    finally:
+        hs_ds = dsm_ds = None
+    return masked
+
+
+def _build_dsm_raster(tile_paths: list, raster_dir: str, jahr: str, area: str, gsd: float,
+                      height_ref: str, work_dir: Path, workers: int, pdal_exe: str,
+                      p0: float, pspan: float) -> tuple:
+    """DSM (Float32, NoData -FLT_MAX, CRS LV95 + Hoehe) und Hillshade (Byte, NoData 255,
+    CRS LV95) aus den fertigen Kacheln. Rueckgabe: (dsm_pfad, hillshade_pfad)."""
+    import math
+    from osgeo import gdal, osr
+    gdal.UseExceptions()
+    osr.UseExceptions()
+
+    srs_compound = f"EPSG:2056+{HEIGHT_REFS[height_ref]}"
+    dsm_name, hs_name = _raster_names(jahr, area, gsd, height_ref)
+    dsm_path = os.path.join(raster_dir, dsm_name)
+    hs_path = os.path.join(raster_dir, hs_name)
+    Path(raster_dir).mkdir(parents=True, exist_ok=True)
+    cells_dir = work_dir / "c"
+    cells_dir.mkdir(parents=True, exist_ok=True)
+
+    boxes = []
+    for t in tile_paths:
+        h = _read_las_header(t)
+        boxes.append((t, h["minx"], h["miny"], h["maxx"], h["maxy"]))
+    snap = (math.floor(min(b[1] for b in boxes) / gsd) * gsd,
+            math.floor(min(b[2] for b in boxes) / gsd) * gsd,
+            math.ceil(max(b[3] for b in boxes) / gsd) * gsd,
+            math.ceil(max(b[4] for b in boxes) / gsd) * gsd)
+    jobs = _dsm_cell_jobs(boxes, snap, gsd)
+    _log(f"  GSD {gsd:g} m  |  CRS DSM {srs_compound}, Hillshade EPSG:2056  |  {len(jobs)} Arbeitszelle(n)")
+    _log(f"  Ziel-Gitter: {snap[0]:.2f}, {snap[1]:.2f} - {snap[2]:.2f}, {snap[3]:.2f}")
+
+    args = [(job, str(cells_dir), work_dir / f"p{i:05d}.json", pdal_exe, gsd, srs_compound)
+            for i, job in enumerate(jobs)]
+    failed = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_raster_cell_worker, a): a for a in args}
+        for done, fut in enumerate(as_completed(futs), 1):
+            status, cell, err = fut.result()
+            if status == "error":
+                failed.append(futs[fut])
+                _log(f"  [{done}/{len(args)}] Zelle {cell}: FEHLER (Wiederholung folgt) - {err}")
+            _progress(p0 + pspan * 0.6 * done / len(args))
+    errors = []
+    for a in failed:
+        # Abgestuerzte pdal.exe sind meist Speicherdruck paralleler Jobs -> seriell wiederholen
+        status, cell, err = _raster_cell_worker(a)
+        if status == "error":
+            errors.append(f"{cell}: {err}")
+    if errors:
+        raise RuntimeError(f"{len(errors)} Raster-Zelle(n) fehlgeschlagen:\n  " + "\n  ".join(errors[:10]))
+    cell_rasters = sorted(str(p) for p in cells_dir.glob("dsm_*.tif"))
+    if not cell_rasters:
+        raise RuntimeError("Keine Raster-Zelle erzeugt - DSM nicht moeglich.")
+
+    vrt_path = work_dir / "dsm_mosaic.vrt"
+    gdal.BuildVRT(str(vrt_path), cell_rasters,
+                  options=gdal.BuildVRTOptions(srcNodata=CELL_NODATA, VRTNodata=CELL_NODATA)).FlushCache()
+    raw_hs = work_dir / "hillshade_raw.tif"
+    filled = _fill_raster_nodata(vrt_path, work_dir, gsd, str(workers), str(raw_hs))
+    _progress(p0 + pspan * 0.8)
+
+    for p in (dsm_path, hs_path):
+        for side in (p, os.path.splitext(p)[0] + ".tfw", p + ".aux.xml"):
+            if os.path.isfile(side):
+                _log(f"  vorhanden, wird ueberschrieben: {os.path.basename(side)}")
+                _discard(side)
+
+    common = dict(format="GTiff", outputBounds=snap, xRes=gsd, yRes=gsd, multithread=True,
+                  warpOptions=[f"NUM_THREADS={workers}"])
+    # Quelle = Ziel-CRS: es wird nichts reprojiziert und keine Hoehe umgerechnet, nur getaggt
+    gdal.Warp(dsm_path, filled, options=gdal.WarpOptions(
+        srcSRS=srs_compound, dstSRS=srs_compound, srcNodata=CELL_NODATA, dstNodata=RASTER_NODATA,
+        creationOptions=RASTER_OUT_CO + ["PREDICTOR=3"], **common)).FlushCache()
+
+    n_clamped = _prepare_hillshade_values(str(raw_hs))
+    hs_ds = gdal.Warp(hs_path, str(raw_hs), options=gdal.WarpOptions(
+        srcSRS="EPSG:2056", dstSRS="EPSG:2056", dstNodata=HILLSHADE_NODATA,
+        creationOptions=RASTER_OUT_CO + ["PREDICTOR=2"], **common))
+    hs_ds.GetRasterBand(1).SetUnitType("")   # Grauwert, keine Einheit (erbt sonst 'metre')
+    hs_ds.FlushCache()
+    hs_ds = None
+    n_masked = _mask_hillshade_by_dsm(hs_path, dsm_path)
+    _log(f"  Hillshade: {n_clamped} Pixel 255/NoData -> {HILLSHADE_VALID_MAX}, "
+         f"{n_masked} Pixel ohne DSM -> NoData {HILLSHADE_NODATA}")
+
+    # Kontrolle statt Annahme: NoData, CRS, deckungsgleiches Gitter
+    problems = []
+    dsm_ds, hs_ds = gdal.Open(dsm_path), gdal.Open(hs_path)
+    nd = dsm_ds.GetRasterBand(1).GetNoDataValue()
+    if nd is None or struct.unpack("<f", struct.pack("<f", nd))[0] != RASTER_NODATA:
+        problems.append(f"DSM-NoData {nd!r}, erwartet {RASTER_NODATA!r}")
+    if hs_ds.GetRasterBand(1).GetNoDataValue() != HILLSHADE_NODATA:
+        problems.append(f"Hillshade-NoData {hs_ds.GetRasterBand(1).GetNoDataValue()!r}, erwartet 255")
+    dsm_srs = dsm_ds.GetSpatialRef()
+    if (dsm_srs is None or not dsm_srs.IsCompound() or dsm_srs.GetAuthorityCode("PROJCS") != "2056"
+            or dsm_srs.GetAuthorityCode("VERT_CS") != str(HEIGHT_REFS[height_ref])):
+        problems.append(f"DSM-CRS {dsm_srs.GetName() if dsm_srs else None!r}, erwartet {srs_compound}")
+    hs_srs = hs_ds.GetSpatialRef()
+    if hs_srs is None or hs_srs.GetAuthorityCode(None) != "2056":
+        problems.append(f"Hillshade-CRS {hs_srs.GetName() if hs_srs else None!r}, erwartet EPSG:2056")
+    geom = [(d.RasterXSize, d.RasterYSize, d.GetGeoTransform()) for d in (dsm_ds, hs_ds)]
+    if geom[0] != geom[1]:
+        problems.append(f"DSM und Hillshade nicht deckungsgleich: {geom}")
+    dsm_label = dsm_srs.GetName() if dsm_srs else "?"
+    dsm_ds = hs_ds = None
+    if problems:
+        raise RuntimeError("Raster-Kontrolle fehlgeschlagen:\n  " + "\n  ".join(problems))
+    _log(f"  Kontrolle OK: NoData DSM {RASTER_NODATA:g} / Hillshade {HILLSHADE_NODATA}, "
+         f"CRS '{dsm_label}', Gitter deckungsgleich")
+    _progress(p0 + pspan)
+    return dsm_path, hs_path
+
+
 # ─── Hauptablauf (Aktion 'process') ────────────────────────────────────────────
 #   1) nur ASCII: jede Datei -> Zwischen-LAZ (readers.text, parallel; grosse gemergte
 #      Dateien vorher an Zeilengrenzen in Teile zerlegt)
 #   2) Header: Punktzahl, LV95-/Z-Plausibilitaet, Ueberlappung innerhalb eines
 #      Kachelsatzes, Grid-Zellen im Datenbereich laden
 #   3) jede Quelle mit 'pdal tile' in Kachelstuecke zerlegen (parallel, Streaming)
-#   4) je Kachelsatz und Grid-Zelle alle Stuecke mergen -> <Basis>_<NAME>_LV95_LN02.laz
+#   4) je Kachelsatz und Grid-Zelle alle Stuecke mergen (+ optional Thinning) -> Endkachel
 #      im Zielformat, validiert und atomar geschrieben (parallel)
-#   5) Punktbilanz Input = Output (+ ausserhalb Grid), Staging aufraeumen
+#   5) Punktbilanz Input = Output (+ ausserhalb Grid, - ausgeduennt)
+#   6) optional: DSM-Raster + Hillshade aus den fertigen Kacheln, Staging aufraeumen
 # Jede Quelldatei wird genau einmal gelesen - auch ein grosses gemergtes Gebiet wird
 # nicht pro Kachel erneut eingelesen.
+#
+# Benennung / CRS (beide Formate): <Jahr>_<AREA>_TIN_DSM[_thinNN]_<NAME>_LV95_<LN02|LHN95>.<laz|las>,
+# ALLE Dateien eines Ordners = EIN Kachelsatz. Der Hoehenbezug kommt aus 'height_ref'; CRS-Tag
+# (LAS/LAZ) bzw. CRS-Angabe im Dateinamen (ASCII) der Quelle wird ignoriert - Widerspruch -> nur
+# Warnung, so laesst sich eine falsche Angabe der Quelle korrigieren. Nichts wird umgerechnet.
 def _process(cfg: dict) -> None:
-    t_start     = time.time()
-    input_dir   = cfg["input_dir"]
-    output_dir  = cfg["output_dir"]
-    grid_path   = cfg["grid_shape_path"]
-    fmt         = cfg.get("format", "ascii")
-    columns     = (cfg.get("columns") or "X Y Z").split()
-    sep_key     = cfg.get("separator", "space")
-    skip        = int(cfg.get("skip") or 0)
-    base_name   = (cfg.get("base_name") or "").strip()
-    workers     = max(1, int(cfg.get("num_workers") or 4))
-    keep        = bool(cfg.get("keep_staging"))
-    chunk_bytes = int(float(cfg.get("ascii_chunk_mb") or ASCII_CHUNK_MB) * 1024 ** 2)
-    staging_dir = cfg.get("staging_dir") or os.path.join(output_dir, "_staging")
-    pdal_exe    = _resolve_pdal_exe(cfg)
+    t_start       = time.time()
+    input_dir     = cfg["input_dir"]
+    output_dir    = cfg["output_dir"]
+    grid_path     = cfg["grid_shape_path"]
+    fmt           = cfg.get("format", "ascii")
+    columns       = (cfg.get("columns") or "X Y Z").split()
+    sep_key       = cfg.get("separator", "space")
+    skip          = int(cfg.get("skip") or 0)
+    jahr          = str(cfg.get("jahr") or "").strip()
+    area          = str(cfg.get("area") or "").strip()
+    height_ref    = str(cfg.get("height_ref") or "LN02").strip().upper()
+    thin_m        = float(cfg.get("thin_m") or 0.0)
+    out_format    = str(cfg.get("out_format") or "laz").strip().lower()
+    create_raster = bool(cfg.get("create_raster"))
+    raster_dir    = str(cfg.get("raster_dir") or "").strip()
+    gsd           = float(cfg.get("gsd") or 0.5)
+    workers       = max(1, int(cfg.get("num_workers") or 4))
+    keep          = bool(cfg.get("keep_staging"))
+    chunk_bytes   = int(float(cfg.get("ascii_chunk_mb") or ASCII_CHUNK_MB) * 1024 ** 2)
+    staging_dir   = cfg.get("staging_dir") or os.path.join(output_dir, "_staging")
+    pdal_exe      = _resolve_pdal_exe(cfg)
 
     # --- Eingaben pruefen, bevor irgendetwas geschrieben wird ---
     if fmt not in ("ascii", "las"):
@@ -797,28 +1361,38 @@ def _process(cfg: dict) -> None:
             raise ValueError(f"Trennzeichen '{sep_key}' ungueltig ({' | '.join(SEPARATORS)})")
         if not {"X", "Y", "Z"} <= set(columns):
             raise ValueError(f"Spalten '{' '.join(columns)}' muessen X, Y und Z enthalten")
+    if not re.fullmatch(r"\d{4}", jahr):
+        raise ValueError(f"Jahr '{jahr}' ungueltig - vierstellig erwartet, z.B. 2021")
+    if not area or re.search(r'[<>:"/\\|?*\s]', area):
+        raise ValueError(f"AREA '{area}' fehlt oder enthaelt unzulaessige Zeichen/Leerzeichen")
+    if height_ref not in HEIGHT_REFS:
+        raise ValueError(f"Hoehenbezug '{height_ref}' unbekannt ({' | '.join(HEIGHT_REFS)})")
+    if thin_m and not any(abs(thin_m - t) < 1e-9 for t in THIN_OPTIONS_M):
+        raise ValueError(f"Thinning {thin_m:g} m nicht vorgesehen ({', '.join(f'{t:g}' for t in THIN_OPTIONS_M)})")
+    if out_format not in OUT_FORMATS:
+        raise ValueError(f"Output-Format '{out_format}' ungueltig ({' | '.join(OUT_FORMATS)})")
+    if create_raster:
+        if not raster_dir:
+            raise ValueError("Raster-Output-Ordner fehlt (Option 'Create DSM-Raster').")
+        if not 0 < gsd <= 100:
+            raise ValueError(f"Raster-Aufloesung {gsd:g} m ungueltig")
     if not os.path.isdir(input_dir):
         raise FileNotFoundError(f"Input-Ordner nicht gefunden: {input_dir}")
     if os.path.normcase(os.path.abspath(input_dir)) == os.path.normcase(os.path.abspath(output_dir)):
         raise ValueError("Output-Ordner muss sich vom Input-Ordner unterscheiden "
                          "(gleiche Namenskonvention -> Quelldateien koennten ueberschrieben werden).")
-    if re.search(r'[<>:"/\\|?*]', base_name):
-        raise ValueError(f"Basisname enthaelt unzulaessige Zeichen: '{base_name}'")
     files = _list_inputs(input_dir, fmt)
     if not files:
         raise FileNotFoundError(f"Keine {fmt.upper()}-Dateien gefunden in: {input_dir}")
-    lhn95 = [os.path.basename(f) for f in files
-             if "LHN95" in os.path.basename(f).upper() or (fmt == "las" and _lhn95_tagged(f))]
-    if lhn95:
-        raise ValueError(f"Quelle ist als LHN95 bezeichnet/getaggt: {lhn95[:10]}\nDieses Tool erwartet "
-                         "LN02-Hoehen und rechnet nicht um - LHN95 -> LN02 mit GeoSuite/REFRAME (HTRANS).")
     if fmt == "ascii":
         # LV03 frueh erkennen (erste Zeilen je Datei), bevor alles eingelesen wird.
         # Massgebend bleibt die Header-Pruefung in Schritt 2.
         lv03 = [os.path.basename(f) for f in files if _sniff_ascii(f)["crs_guess"] == "LV03"]
         if lv03:
             raise ValueError(f"Quelldaten in LV03 statt LV95: {lv03[:10]}\n{NOT_LV95_HINT}")
-    groups   = _group_by_base(files, base_name)
+    groups   = {_las_tile_base(jahr, area, thin_m): list(files)}
+    out_ext  = out_format
+    suffix   = _height_suffix(height_ref)
     group_of = {f: b for b, members in groups.items() for f in members}
 
     point_format = OUT_POINT_FORMAT
@@ -827,7 +1401,7 @@ def _process(cfg: dict) -> None:
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     run_dir = Path(staging_dir) / f"d2l_{time.strftime('%y%m%d_%H%M%S')}"
-    _check_path_lengths(files, run_dir, output_dir, max(len(b) for b in groups))
+    _check_path_lengths(files, run_dir, output_dir, max(len(b) for b in groups), suffix)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     _log(f"Input-Ordner   : {input_dir}")
@@ -836,13 +1410,16 @@ def _process(cfg: dict) -> None:
         _log(f"  Spalten      : {' '.join(columns)}  |  Trennzeichen: {sep_key}  |  Kopfzeilen: {skip}")
     _log(f"Output-Ordner  : {output_dir}")
     _log(f"Grid-Shape     : {grid_path}")
-    _log("Referenzsystem : EPSG:2056 + 5728 (LV95 / LN02) - nur CRS-Tag, keine Umrechnung")
+    _log(f"Referenzsystem : EPSG:2056 + {HEIGHT_REFS[height_ref]} (LV95 / {height_ref}) - nur CRS-Tag, "
+         "keine Umrechnung; CRS-Angaben der Quelle werden ersetzt")
+    _log(f"Thinning       : " + (f"{thin_m:g} m (filters.sample, Mindestabstand)" if thin_m else "kein"))
+    _log(f"Raster         : " + (f"DSM + Hillshade, GSD {gsd:g} m -> {raster_dir}" if create_raster else "nein"))
     _log(f"pdal.exe       : {pdal_exe}")
     _log(f"Parallel       : {workers} Prozess(e)  |  Staging: {run_dir}")
     _log(f"Kachelsaetze   : {len(groups)}")
     for b, members in groups.items():
-        _log(f"  {b}_<NAME>{OUT_NAME_SUFFIX}.laz  <-  " + (os.path.basename(members[0]) if len(members) == 1
-                                                            else f"{len(members)} Dateien"))
+        _log(f"  {b}_<NAME>{suffix}.{out_ext}  <-  " + (os.path.basename(members[0]) if len(members) == 1
+                                                         else f"{len(members)} Dateien"))
 
     names = {f: os.path.basename(f) for f in files}
     origin_of = {f: f for f in files}   # Quelle (Zwischen-LAZ bzw. Input-LAZ) -> Input-Datei
@@ -890,24 +1467,43 @@ def _process(cfg: dict) -> None:
             p0, pspan = 0.3, 0.7
         else:
             sources, p0, pspan = list(files), 0.0, 1.0
+        if create_raster:
+            pspan *= 0.7   # Rest des Fortschrittsbalkens fuer DSM + Hillshade
 
         # 2) Header, Koordinaten-/Hoehenplausibilitaet, Ueberlappungen
         _log("\n[2/4] Quell-Header pruefen ...")
         headers = {s: _read_las_header(s) for s in sources}
-        not_lv95 = set()
+        not_lv95, kinds = set(), set()
         for s, h in headers.items():
             crs = _classify_crs(h["minx"], h["miny"], h["maxx"], h["maxy"])
             if crs != "LV95":
-                not_lv95.add(f"{names[origin_of[s]]}: {crs}  (X {h['minx']:.0f}-{h['maxx']:.0f}, "
-                             f"Y {h['miny']:.0f}-{h['maxy']:.0f})")
+                kinds.add(crs)
+                not_lv95.add(f"{names[origin_of[s]]}: {crs}  (X {h['minx']:.6g}-{h['maxx']:.6g}, "
+                             f"Y {h['miny']:.6g}-{h['maxy']:.6g})")
         if not_lv95:
             raise ValueError("Quelldaten nicht in LV95 (EPSG:2056):\n  " + "\n  ".join(sorted(not_lv95)[:10])
-                             + "\n" + NOT_LV95_HINT)
+                             + "\n" + (DEGREE_HINT if kinds == {"GRAD"} else NOT_LV95_HINT))
+        # Hoehenangabe der Quelle (LAS: CRS-Tag, ASCII: Dateiname) gegen die Auswahl - nur Warnung
         if fmt == "las":
-            _log(f"  CRS-Tag (1. Datei): {_pdal_srs_name(pdal_exe, sources[0])}")
-            if any(h["point_format"] in PC_FORMATS_WITH_RGB for h in headers.values()):
-                point_format = OUT_POINT_FORMAT_RGB
-                _log("  Quelle fuehrt Farbe (RGB) -> Ausgabe als PF7 statt PF6")
+            _log(f"  CRS-Tag (1. Datei): {_pdal_srs_name(pdal_exe, sources[0])}  -> wird ersetzt durch "
+                 f"LV95/{height_ref}")
+        where = "getaggt" if fmt == "las" else "im Dateinamen bezeichnet"
+        tags = {}
+        for f in files:
+            tags.setdefault(_source_height(f, fmt) or "ohne", []).append(names[f])
+        for tag, members in sorted(tags.items()):
+            if tag not in ("ohne", height_ref):
+                _log(f"  WARNUNG: {len(members)} Datei(en) sind als {tag} {where}, gewaehlt ist "
+                     f"{height_ref} (z.B. {members[0]}). Die Hoehen werden NICHT umgerechnet, nur "
+                     f"als {height_ref} getaggt - Hoehenbezug der Quelle pruefen!")
+        if "ohne" in tags:
+            _log(f"  Hinweis: {len(tags['ohne'])} Datei(en) ohne Hoehenangabe -> werden als {height_ref} getaggt")
+        if fmt == "las":
+            formats = sorted({h["point_format"] for h in headers.values()})
+            point_format = _target_point_format(formats)
+            _log(f"  Punktformat Quelle PF{'/'.join(str(f) for f in formats)} -> Ausgabe PF{point_format}")
+            if set(formats) & {4, 5, 9, 10}:
+                _log("  WARNUNG: Quelle enthaelt Waveform-Formate - Waveform-Daten werden nicht uebernommen.")
 
         # Ueberlappen sich zwei Input-Dateien desselben Kachelsatzes, entstuenden beim
         # Zusammenfuehren doppelte Punkte (z.B. Kachel-Buffer oder zwei Varianten eines Gebiets)
@@ -923,8 +1519,9 @@ def _process(cfg: dict) -> None:
             raise ValueError("Input-Dateien desselben Kachelsatzes ueberlappen raeumlich - beim Zusammenfuehren "
                              "entstuenden doppelte Punkte:\n  "
                              + "\n  ".join(f"{names[a]}  <->  {names[b]}" for a, b in clashes[:10])
-                             + "\nUeberlappende Kachelraender (Buffer) oder zwei Varianten desselben Gebiets? "
-                               "Dateien getrennt verarbeiten bzw. Basisname-Feld leer lassen.")
+                             + "\nUeberlappende Kachelraender (Buffer) oder zwei Varianten desselben Gebiets "
+                               "(z.B. merged.laz UND Einzelkacheln im selben Ordner)? Dateien getrennt "
+                               "verarbeiten.")
 
         total_in = sum(h["count"] for h in headers.values())
         bbox = (min(h["minx"] for h in headers.values()), min(h["miny"] for h in headers.values()),
@@ -941,8 +1538,8 @@ def _process(cfg: dict) -> None:
         _log(f"  Punkte Input  : {_fmt_count(total_in)}")
         size, cells = _load_grid_cells(grid_path, bbox)
         _log(f"  Grid          : {len(cells)} Zelle(n) im Datenbereich, Zellgroesse {size:g} m")
-        _log(f"  Zielformat    : LAS 1.{OUT_MINOR_VERSION} / PF{point_format} / LAZ, scale {OUT_SCALE}, "
-             f"Offset = Kachelursprung, global_encoding {OUT_GLOBAL_ENCODING}")
+        _log(f"  Zielformat    : LAS 1.{OUT_MINOR_VERSION} / PF{point_format} / {out_ext.upper()}, "
+             f"scale {OUT_SCALE}, Offset = Kachelursprung, global_encoding {OUT_GLOBAL_ENCODING}")
 
         # 3) Zerlegen in Kachelstuecke
         _log("\n[3/4] Quellen in Kachelstuecke zerlegen (pdal tile) ...")
@@ -979,12 +1576,13 @@ def _process(cfg: dict) -> None:
             expected = sum(c for _, c in by_cell[key])
             if expected == 0:
                 continue
-            out_path = os.path.join(output_dir, f"{b}_{cells[(ix, iy)]}{OUT_NAME_SUFFIX}.laz")
+            out_path = os.path.join(output_dir, f"{b}_{cells[(ix, iy)]}{suffix}.{out_ext}")
             jobs.append(((ix, iy), out_path, [p for p, _ in by_cell[key]], expected,
-                         run_dir / f"t{j:05d}.json", pdal_exe, size, point_format))
-        _log(f"\n[4/4] {len(jobs)} Kachel(n) schreiben ...")
-        written = empty = overwritten = total_out = 0
-        errors = []
+                         run_dir / f"t{j:05d}.json", pdal_exe, size, point_format, height_ref, thin_m))
+        _log(f"\n[4/4] {len(jobs)} Kachel(n) schreiben" + (f" (Thinning {thin_m:g} m)" if thin_m else "") + " ...")
+        written = empty = overwritten = total_out = merged_in = 0
+        errors, out_paths = [], []
+        expected_of = {os.path.basename(job[1]): job[3] for job in jobs}
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = [ex.submit(_tile_worker, job) for job in jobs]
             for done, fut in enumerate(as_completed(futs), 1):
@@ -993,8 +1591,12 @@ def _process(cfg: dict) -> None:
                 if status == "written":
                     written += 1
                     total_out += count
+                    merged_in += expected_of[out_name]
                     overwritten += int(existed)
-                    _log(f"{prefix_log}  ({_fmt_count(count)} Punkte)" + ("  - ueberschrieben" if existed else ""))
+                    out_paths.append(os.path.join(output_dir, out_name))
+                    _log(f"{prefix_log}  ({_fmt_count(count)} Punkte"
+                         + (f" von {_fmt_count(expected_of[out_name])}" if thin_m else "") + ")"
+                         + ("  - ueberschrieben" if existed else ""))
                 elif status == "empty":
                     empty += 1
                     _log(f"{prefix_log}  - leer, nicht geschrieben")
@@ -1003,26 +1605,41 @@ def _process(cfg: dict) -> None:
                     _log(f"{prefix_log}  - FEHLER: {err}")
                 _progress(p0 + pspan * (0.4 + 0.6 * done / len(jobs)))
 
-        # 5) Zusammenfassung + Punktbilanz
-        balance = total_in - total_out - outside_points
-        dt = time.time() - t_start
+        # 5) Zusammenfassung + Punktbilanz. Mit Thinning wird die Bilanz VOR dem Ausduennen
+        # gezogen (Summe der Kachelstuecke je geschriebener Kachel), die Differenz ist gewollt.
+        balance = total_in - (merged_in if thin_m else total_out) - outside_points
         _log("\nZusammenfassung:")
         _log(f"  Kacheln geschrieben : {written}" + (f"  (davon {overwritten} ueberschrieben)" if overwritten else ""))
         if empty:
             _log(f"  leere Kacheln       : {empty}")
         _log(f"  Punkte Input        : {_fmt_count(total_in)}")
-        _log(f"  Punkte Output       : {_fmt_count(total_out)}")
+        if thin_m:
+            share = 100.0 * total_out / merged_in if merged_in else 0.0
+            _log(f"  Punkte vor Thinning : {_fmt_count(merged_in)}")
+            _log(f"  Punkte Output       : {_fmt_count(total_out)}  ({share:.1f} % nach Thinning {thin_m:g} m)")
+        else:
+            _log(f"  Punkte Output       : {_fmt_count(total_out)}")
         if outside_points:
             _log(f"  ausserhalb Grid     : {_fmt_count(outside_points)}")
         _log(f"  Punktbilanz         : " + ("OK (kein Punkt verloren/doppelt)" if balance == 0
                                             else f"DIFFERENZ {_fmt_count(balance)}"))
-        _log(f"  Laufzeit            : {int(dt // 60)}m {int(dt % 60):02d}s")
         if errors:
             raise RuntimeError(f"{len(errors)} Kachel(n) fehlgeschlagen:\n  " + "\n  ".join(errors[:20]))
         if written == 0:
             raise RuntimeError("Keine Kachel geschrieben - Grid-Shape und Input pruefen.")
         if balance != 0:
             raise RuntimeError("Punktbilanz stimmt nicht - Ergebnis pruefen (siehe Log).")
+
+        # 6) optional DSM-Raster + Hillshade aus genau den geschriebenen Kacheln
+        if create_raster:
+            _log(f"\n[Raster] DSM + Hillshade aus {len(out_paths)} Kachel(n) ...")
+            dsm_path, hs_path = _build_dsm_raster(sorted(out_paths), raster_dir, jahr, area, gsd,
+                                                  height_ref, run_dir / "r", workers, pdal_exe,
+                                                  p0 + pspan, 1.0 - (p0 + pspan))
+            _log(f"  DSM       : {dsm_path}  (+ .tfw)")
+            _log(f"  Hillshade : {hs_path}  (+ .tfw)")
+        dt = time.time() - t_start
+        _log(f"\nLaufzeit: {int(dt // 60)}m {int(dt % 60):02d}s")
         _log("Fertig.")
     finally:
         if keep:
