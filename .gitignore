@@ -1,5 +1,6 @@
-# Claude Code Einstellungen – nicht ins Repository
+# Claude Code Einstellungen und lokale Projektnotizen – nicht ins Repository
 .claude/
+CLAUDE.local.md
 
 # Python
 __pycache__/
@@ -14,3 +15,4 @@ logs/
 
 # Lokale Konfiguration (Pfad zum OSGeo4W/QGIS-Python, wird automatisch angelegt)
 process_scripts/_dsm2laz_config.json
+CLAUDE.md
