@@ -1,5 +1,5 @@
 """
-GUI_DSMdata_to_DSMdata.py  –  DSM ASCII/LAZ → LAZ-Tiles GUI
+GUI_DSMpointcloudConverter.py  –  DSM ASCII/LAZ → LAZ-Tiles GUI
 Tkinter-Oberflaeche fuer die Umwandlung alter DSM-Punktwolken, je Input-Format ein Tab:
   - DSM.ascii → DSM.laz-Tiles:  ASCII (xyz)                        → LAZ/LAS-Kacheln
   - DSM.laz   → DSM.laz-Tiles:  LAZ/LAS (beliebiges Tiling/merged) → LAZ/LAS-Kacheln

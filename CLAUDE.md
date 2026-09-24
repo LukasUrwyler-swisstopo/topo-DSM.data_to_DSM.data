@@ -1,11 +1,11 @@
-# CLAUDE.md – topo-DSMdata_to_DSMdata
+# CLAUDE.md – topo-DSMpointcloudConverter
 
 Alte DSM-Punktwolken (ASCII-xyz, meist **gemergt pro Gebiet**, oder LAZ/LAS in beliebigem Tiling)
 → GDWH-taugliche LAZ-Kacheln gemäss swissGRID 1km², optional Thinning und DSM + Hillshade.
 Details und Begründungen: `README.md`.
 
 ## Architektur
-- `GUI_DSMdata_to_DSMdata.py` – Tkinter mit Standard-Python, **muss Python-3.6-kompatibel bleiben**
+- `GUI_DSMpointcloudConverter.py` – Tkinter mit Standard-Python, **muss Python-3.6-kompatibel bleiben**
   (Firmen-Standard): kein Walrus, keine `list[int]`-Annotationen zur Laufzeit, `tk.Spinbox` statt
   `ttk.Spinbox`, `subprocess.run` ohne `capture_output`.
   Je Input-Format ein Tab (`TilesTab`, `fmt` = `ascii` / `las`); Log, Fortschritt, OSGeo4W-Python
